@@ -1,0 +1,847 @@
+# certificate_view.py
+import os
+import sys
+import re
+import math
+from collections import defaultdict, OrderedDict
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+# nptdms
+try:
+    from nptdms import TdmsFile
+    NPTDMS_OK = True
+except Exception:
+    TdmsFile = None
+    NPTDMS_OK = False
+
+# numpy (media su tutti i campioni)
+try:
+    import numpy as np
+    NUMPY_OK = True
+except Exception:
+    NUMPY_OK = False
+
+# Export PDF (opzionale)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as rl_canvas
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+
+
+# -------------------- UI helper --------------------
+def _kv_row(parent, label, value="—"):
+    row = tk.Frame(parent, bg="#ffffff")
+    row.pack(fill="x", padx=8, pady=2)
+    tk.Label(row, text=label, width=22, anchor="w", bg="#ffffff",
+             font=("Segoe UI", 10, "bold")).pack(side="left")
+    tk.Label(row, text=value if value else "—", anchor="w", bg="#ffffff",
+             font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+    return row
+
+
+# -------------------- TDMS utils (scalar per Contract/Loop) --------------------
+def _first_nonempty(seq):
+    if not (hasattr(seq, "__iter__") and not isinstance(seq, (str, bytes, bytearray))):
+        seq = [seq]
+    for x in seq:
+        if x is None:
+            continue
+        if isinstance(x, (bytes, bytearray)):
+            try:
+                x = x.decode("utf-8", errors="ignore")
+            except Exception:
+                x = str(x)
+        s = str(x).strip()
+        if s:
+            return s
+    return ""
+
+def _get_group_ci(tdms, group_name: str):
+    tgt = (group_name or "").lower()
+    for g in tdms.groups():
+        if (g.name or "").lower() == tgt:
+            return g
+    return None
+
+def _get_channel_ci(group, channel_name: str):
+    tgt = (channel_name or "").lower()
+    for ch in group.channels():
+        if (ch.name or "").lower() == tgt:
+            return ch
+    return None
+
+def tdms_read_scalar_string(tdms, group_name: str, channel_name: str) -> str:
+    try:
+        grp = _get_group_ci(tdms, group_name)
+        if not grp:
+            return "—"
+        ch = _get_channel_ci(grp, channel_name)
+        if not ch:
+            return "—"
+        try:
+            data = ch[:]
+        except Exception:
+            data = getattr(ch, "data", [])
+        val = _first_nonempty(data)
+        return val if val else "—"
+    except Exception:
+        return "—"
+
+
+# -------------------- PERFORMANCE loader (dinamico + media a chunk) --------------------
+GROUP_RE = re.compile(
+    r"^(?P<test>\d+)_(?P<point>\d+)_"
+    r"(?P<prefix>PERFORMANCE_PERFORM)"
+    r"_(?:Test_)?(?P<kind>Recorded|Calc|Converted)$"
+)
+
+KIND_ORDER = ("Recorded", "Calc", "Converted")
+
+KNOWN_UNITS = {"rpm", "m3/h", "m", "kw", "%", "bar", "pa", "°c"}
+NOISE_TOKENS = {"-", "–", "—"}
+INCLUDE_ALWAYS = {"rpm"}
+QUAL_MAP = {
+    "suct": "Suction", "suct.": "Suction", "suction": "Suction",
+    "disch": "Discharge", "disch.": "Discharge", "discharge": "Discharge",
+    "in": "In", "out": "Out",
+}
+
+def _tokens(raw: str):
+    return [t for t in (raw or "").split() if t]
+
+def _is_unit(tok: str) -> bool:
+    return tok.lower().strip("[]()") in KNOWN_UNITS
+
+def _is_noise(tok: str) -> bool:
+    if tok in NOISE_TOKENS:
+        return True
+    return bool(re.fullmatch(r"[\W_]+", tok))
+
+def _primary_token(raw: str):
+    for t in _tokens(raw):
+        if t.lower().strip("[]()") in INCLUDE_ALWAYS:
+            return t
+    for t in _tokens(raw):
+        if _is_unit(t) or _is_noise(t):
+            continue
+        return t
+    return None
+
+def _find_qualifier(raw: str):
+    toks = _tokens(raw)
+    if not toks:
+        return None
+    base = _primary_token(raw)
+    started = False
+    for t in toks:
+        if not started:
+            if t == base:
+                started = True
+            continue
+        if _is_unit(t) or _is_noise(t):
+            continue
+        low = t.lower().strip().strip("[]()")
+        if low in QUAL_MAP:
+            return QUAL_MAP[low]
+        if re.search(r"[A-Za-z0-9]", t):
+            return t.replace("/", "_")
+    return None
+
+def _find_unit(raw: str):
+    for t in _tokens(raw):
+        low = t.lower().strip("[]()")
+        if low in KNOWN_UNITS:
+            return low
+    return None
+
+def _mean_all_strict(data):
+    """
+    Media su TUTTI i campioni: non-finito -> 0. Ritorna float.
+    Se il canale non è numerico, ritorna 0.0.
+    """
+    if NUMPY_OK:
+        try:
+            a = np.asarray(data, dtype=float)
+        except Exception:
+            return 0.0
+        if a.size == 0:
+            return 0.0
+        a = a.copy()
+        mask = ~np.isfinite(a)
+        if mask.any():
+            a[mask] = 0.0
+        return float(np.mean(a))
+    # fallback
+    seq = data if hasattr(data, "__iter__") and not isinstance(data, (str, bytes, bytearray)) else [data]
+    total = 0.0
+    n = 0
+    for v in seq:
+        try:
+            f = float(v)
+        except Exception:
+            f = 0.0
+        if math.isfinite(f):
+            total += f
+        else:
+            total += 0.0
+        n += 1
+    return (total / n) if n else 0.0
+
+def _fmt_num(x):
+    try:
+        return f"{float(x):g}"
+    except Exception:
+        return str(x)
+
+def _collect_perf_points(tdms, test_index: int = 0):
+    """
+    -> points[point]['Recorded'/'Calc'/'Converted'] = [TdmsGroup, ...]
+    """
+    points = defaultdict(lambda: {"Recorded": [], "Calc": [], "Converted": []})
+    for g in tdms.groups():
+        m = GROUP_RE.match(g.name or "")
+        if not m:
+            continue
+        if int(m.group("test")) != int(test_index):
+            continue
+        p = int(m.group("point"))
+        k = m.group("kind")
+        points[p][k].append(g)
+    return dict(points)
+
+# ---------- MEDIA STREAMING: robusto per canali molto lunghi ----------
+def _nan_sum_and_count(a):
+    """Ritorna (somma, conteggio) considerando non-finiti come esclusi (non contati)."""
+    if NUMPY_OK:
+        try:
+            finite = np.isfinite(a)
+        except Exception:
+            # se 'a' non è array numpy, prova a convertirlo
+            try:
+                a = np.asarray(list(a), dtype=float)
+                finite = np.isfinite(a)
+            except Exception:
+                return 0.0, 0
+        if not np.any(finite):
+            return 0.0, 0
+        s = float(np.sum(a[finite]))
+        c = int(np.count_nonzero(finite))
+        return s, c
+    # fallback pure-Python
+    s = 0.0; c = 0
+    for v in a:
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if math.isfinite(f):
+            s += f; c += 1
+    return s, c
+
+def _mean_channel_fast(ch, chunk_size=2_000_000, use_float32=True):
+    """
+    Media su TUTTI i campioni del canale 'ch', a chunk, con gestione NaN/Inf.
+    Non carica mai l'intero vettore in RAM. Ritorna float (0.0 se nessun numerico).
+    """
+    # prova a conoscere la lunghezza
+    try:
+        n = len(ch)
+    except Exception:
+        # fallback super-robusto
+        try:
+            data = ch[:]
+        except Exception:
+            data = getattr(ch, "data", [])
+        return _mean_all_strict(data)
+
+    total = 0.0
+    count = 0
+
+    to_dtype = np.float32 if (NUMPY_OK and use_float32) else float
+
+    start = 0
+    while start < n:
+        stop = min(start + chunk_size, n)
+        try:
+            part = ch[start:stop]   # nptdms supporta slicing
+        except Exception:
+            try:
+                part = ch[:]
+            except Exception:
+                part = getattr(ch, "data", [])
+            start = n  # interrompi il loop
+        else:
+            start = stop
+
+        if NUMPY_OK:
+            try:
+                arr = np.asarray(part, dtype=to_dtype, order="C")
+            except Exception:
+                arr = np.array([], dtype=to_dtype)
+        else:
+            arr = list(part)
+
+        s, c = _nan_sum_and_count(arr)
+        total += s
+        count += c
+
+    if count == 0:
+        return 0.0
+    return total / count
+# ---------------------------------------------------------------------
+
+def _build_kind_model(groups_by_point: dict, kind_name: str):
+    """
+    Dato un dict point -> [TdmsGroup,...] per un 'kind', costruisce:
+      - columns: chiavi dinamiche (Base[_Qual][_unit][__2..]) in ordine di prima occorrenza
+      - units:   unità corrispondenti ("" se assente)
+      - rows:    lista di tuple allineate alle columns, una per point crescente
+    """
+    columns, units, rows = [], [], []
+    seen_cols = set()
+
+    # 1) determina colonne globali
+    for p in sorted(groups_by_point.keys()):
+        dup_seq = defaultdict(int)
+        for grp in groups_by_point[p]:
+            for ch in grp.channels():
+                base = _primary_token(ch.name)
+                if base is None:
+                    continue
+                qual = _find_qualifier(ch.name)
+                unit = _find_unit(ch.name)
+                unit_suffix = f"_{unit}" if unit else ""
+                base_key = f"{base}_{qual}{unit_suffix}" if qual else f"{base}{unit_suffix}"
+                key = base_key
+                if key in [k for k in columns] or key in seen_cols:
+                    if any(k == key for k in columns):
+                        dup_seq[base_key] += 1
+                        key = f"{base_key}__{dup_seq[base_key]+1}"
+                if key not in seen_cols:
+                    seen_cols.add(key)
+                    columns.append(key)
+                    units.append(unit or "")
+
+    # 2) costruisci le righe
+    for p in sorted(groups_by_point.keys()):
+        row_map = {}
+        dup_seq = defaultdict(int)
+        for grp in groups_by_point[p]:
+            for ch in grp.channels():
+                base = _primary_token(ch.name)
+                if base is None:
+                    continue
+                qual = _find_qualifier(ch.name)
+                unit = _find_unit(ch.name)
+                unit_suffix = f"_{unit}" if unit else ""
+                base_key = f"{base}_{qual}{unit_suffix}" if qual else f"{base}{unit_suffix}"
+                key = base_key
+                if key in row_map:
+                    dup_seq[base_key] += 1
+                    key = f"{base_key}__{dup_seq[base_key]+1}"
+
+                # media su TUTTI i campioni (streaming a chunk, niente array gigante)
+                try:
+                    mean_val = _mean_channel_fast(ch)
+                except Exception:
+                    try:
+                        data = ch[:]
+                    except Exception:
+                        data = getattr(ch, "data", [])
+                    mean_val = _mean_all_strict(data)
+
+                row_map[key] = _fmt_num(mean_val)
+
+        rows.append(tuple(row_map.get(c, "") for c in columns))
+
+    return columns, units, rows
+
+
+# -------------------- NEW: builder SOLO per Recorded (niente unità nei titoli, niente duplicati fantasma) --------------------
+def _build_recorded_model(groups_by_point: dict):
+    """
+    Costruisce il modello per la tabella Recorded:
+      - Titoli colonna SENZA unità: Base[_Qual] (+ __2, __3... se nello stesso point esistono duplicati)
+      - Unità mostrate solo nella riga 'Units' (prima unità incontrata per quella base)
+      - Niente colonne duplicate fantasma: per ogni Base[_Qual] si crea un numero di colonne pari
+        al massimo di occorrenze trovato tra tutti i point.
+    """
+    # 1) Scansione: conteggio occorrenze per point e prima unità vista per ciascuna base
+    first_seen_order = []             # ordine globale di prima apparizione delle basi
+    preferred_unit = {}               # base -> unit (prima vista)
+    max_dups = defaultdict(int)       # base -> massimo numero di occorrenze tra i point
+
+    def base_no_unit(ch_name: str):
+        base = _primary_token(ch_name)
+        if base is None:
+            return None, None
+        qual = _find_qualifier(ch_name)
+        unit = _find_unit(ch_name) or ""
+        key = f"{base}_{qual}" if qual else f"{base}"
+        return key, unit
+
+    for p in sorted(groups_by_point.keys()):
+        counts_this_point = defaultdict(int)  # base -> occorrenze nel point
+        for grp in groups_by_point[p]:
+            for ch in grp.channels():
+                key, unit = base_no_unit(ch.name)
+                if key is None:
+                    continue
+                counts_this_point[key] += 1
+                if key not in preferred_unit:
+                    preferred_unit[key] = unit
+                if key not in first_seen_order:
+                    first_seen_order.append(key)
+        for key, cnt in counts_this_point.items():
+            if cnt > max_dups[key]:
+                max_dups[key] = cnt
+
+    # 2) Colonne globali nell'ordine di prima apparizione
+    columns = []
+    units = []
+    for key in first_seen_order:
+        n = max(1, max_dups.get(key, 1))
+        for i in range(1, n + 1):
+            col_name = key if i == 1 else f"{key}__{i}"
+            columns.append(col_name)
+            units.append(preferred_unit.get(key, ""))
+
+    # 3) Righe
+    rows = []
+    for p in sorted(groups_by_point.keys()):
+        seq = defaultdict(int)
+        row_map = {}
+        for grp in groups_by_point[p]:
+            for ch in grp.channels():
+                key, _unit = base_no_unit(ch.name)
+                if key is None:
+                    continue
+                seq[key] += 1
+                col = key if seq[key] == 1 else f"{key}__{seq[key]}"
+
+                try:
+                    mean_val = _mean_channel_fast(ch)
+                except Exception:
+                    try:
+                        data = ch[:]
+                    except Exception:
+                        data = getattr(ch, "data", [])
+                    mean_val = _mean_all_strict(data)
+
+                row_map[col] = _fmt_num(mean_val)
+
+        rows.append(tuple(row_map.get(c, "") for c in columns))
+
+    return columns, units, rows
+
+
+def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
+    """
+    Ritorna:
+      {
+        "Recorded":  {"columns": [...], "units": [...], "rows": [tuple,...]},
+        "Calc":      {...},
+        "Converted": {...}
+      }
+    """
+    out = {k: {"columns": [], "units": [], "rows": []} for k in KIND_ORDER}
+    if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
+        return out
+    try:
+        tdms = TdmsFile.open(tdms_path)
+    except Exception:
+        return out
+    try:
+        points = _collect_perf_points(tdms, test_index=test_index)
+        if not points:
+            return out
+        by_kind = {k: defaultdict(list) for k in KIND_ORDER}
+        for p, kinds in points.items():
+            for k in KIND_ORDER:
+                if kinds[k]:
+                    by_kind[k][p].extend(kinds[k])
+
+        # Recorded: titoli SENZA unità, set colonne coerente (no duplicati fantasma)
+        if by_kind["Recorded"]:
+            cols, units, rows = _build_recorded_model(by_kind["Recorded"])
+            out["Recorded"]["columns"] = cols
+            out["Recorded"]["units"]   = units
+            out["Recorded"]["rows"]    = rows
+
+        # Calc + Converted: invariati (titoli con unità come prima)
+        for k in ("Calc", "Converted"):
+            if by_kind[k]:
+                cols, units, rows = _build_kind_model(by_kind[k], k)
+                out[k]["columns"] = cols
+                out[k]["units"]   = units
+                out[k]["rows"]    = rows
+
+        return out
+    finally:
+        try: tdms.close()
+        except Exception: pass
+
+
+# -------------------- Export PDF placeholder --------------------
+def _export_pdf_placeholder(pdf_path: str, header_text: str, meta_lines: list[str]):
+    if not REPORTLAB_OK:
+        raise RuntimeError("ReportLab non installato")
+    c = rl_canvas.Canvas(pdf_path, pagesize=A4)
+    w, h = A4
+    c.setFont("Helvetica-Bold", 18); c.drawString(40, h - 60, header_text)
+    y = h - 100; c.setFont("Helvetica", 10)
+    for line in meta_lines:
+        c.drawString(40, y, line); y -= 16
+    y -= 12; c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Contractual Data")
+    y -= 10; c.setFont("Helvetica", 10); c.drawString(40, y, "(contenuti in arrivo)")
+    y -= 24; c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Loop Details — Test performed with :")
+    y -= 10; c.setFont("Helvetica", 10); c.drawString(40, y, "(contenuti in arrivo)")
+    y -= 24; c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Recorded / Calculated / Converted")
+    y -= 10; c.setFont("Helvetica", 10); c.drawString(40, y, "(tabelle in arrivo)")
+    c.showPage(); c.save()
+
+
+# -------------------- Apertura file con OS --------------------
+def _open_file_with_os(path: str):
+    if not path or not os.path.exists(path):
+        messagebox.showwarning("File", "File non trovato.")
+        return
+    if sys.platform.startswith("win"):
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        import subprocess
+        subprocess.run(["open", path], check=False)
+    else:
+        import subprocess
+        subprocess.run(["xdg-open", path], check=False)
+
+
+# -------------------- Finestra di dettaglio --------------------
+def open_detail_window(root, columns, values, meta):
+    win = tk.Toplevel(root)
+    win.title("Test Certificate")
+    win.geometry("1500x900")
+    win.minsize(1200, 740)
+    win.configure(bg="#f0f0f0")
+
+    # --- dalla dashboard ---
+    cert_num   = values[1] if len(values) > 1 else "—"
+    test_date  = values[4] if len(values) > 4 else "—"
+    job_dash   = values[0] if len(values) > 0 else "—"
+    pump_dash  = values[3] if len(values) > 3 else "—"
+
+    # stato runtime: percorso TDMS caricato dall’utente
+    state = {"tdms_path": None}
+
+    # -------------------- UI layout --------------------
+    nb = ttk.Notebook(win); nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    tab = tk.Frame(nb, bg="#ffffff"); nb.add(tab, text="Certificato")
+
+    tab.columnconfigure(0, weight=1)
+    tab.rowconfigure(1, weight=1)
+
+    # Header
+    header = tk.Frame(tab, bg="#ffffff")
+    header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16,8))
+    header.columnconfigure(0, weight=1)
+    header.columnconfigure(1, weight=1)
+    tk.Label(header, text="TEST CERTIFICATE", bg="#ffffff", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
+    right = tk.Frame(header, bg="#ffffff"); right.grid(row=0, column=1, sticky="e")
+    tk.Button(right, text="Carica TDMS…", command=lambda: do_load_tdms(), width=14).pack(side="right", padx=(8,0))
+    lbl_cert = tk.Label(right, text=f"N° Cert.: {cert_num}", bg="#ffffff", font=("Segoe UI", 10)); lbl_cert.pack(anchor="e")
+    tk.Label(right, text="U.M. System: SI (Metric)", bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="e")
+    lbl_date = tk.Label(right, text=f"Test Date: {test_date}", bg="#ffffff", font=("Segoe UI", 10)); lbl_date.pack(anchor="e")
+
+    # Body scroll unico
+    body_wrap = tk.Frame(tab, bg="#ffffff"); body_wrap.grid(row=1, column=0, sticky="nsew")
+    body_wrap.columnconfigure(0, weight=1); body_wrap.rowconfigure(0, weight=1)
+    canvas = tk.Canvas(body_wrap, highlightthickness=0, bg="#ffffff")
+    vscroll = ttk.Scrollbar(body_wrap, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vscroll.set)
+    canvas.grid(row=0, column=0, sticky="nsew"); vscroll.grid(row=0, column=1, sticky="ns")
+    body = tk.Frame(canvas, bg="#ffffff"); body_id = canvas.create_window((0,0), window=body, anchor="nw")
+
+    def _on_cfg(_e=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        try: canvas.itemconfigure(body_id, width=canvas.winfo_width())
+        except Exception: pass
+    canvas.bind("<Configure>", _on_cfg)
+    body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+    # Containers (vuoti all'avvio)
+    blocks = tk.Frame(body, bg="#ffffff")
+    blocks.pack(fill="x", padx=16, pady=(8,8))
+    blocks.columnconfigure(0, weight=1)
+    blocks.columnconfigure(1, weight=1)
+
+    tables_row = tk.Frame(body, bg="#ffffff")
+    tables_row.pack(fill="both", expand=True, padx=16, pady=(8,16))
+    for c in range(3):
+        tables_row.columnconfigure(c, weight=1, uniform="tbls")
+    tables_row.rowconfigure(0, weight=1)
+
+    # --- renderer: Contractual + Loop -------------------------------------------------
+    def render_contract_and_loop(tdms_path: str):
+        for w in blocks.winfo_children():
+            w.destroy()
+
+        # default
+        cap = tdh = eff = abs_pow = speed = sg = temp = visc = npsh = liquid = "—"
+        cust = po = end_user = specs = "—"
+        item = pump = sn = imp_draw = imp_mat = imp_dia = "—"
+        motor_num = flowmeter = suction = discharge = watt_const = atmpress = knpsh = watertemp = kventuri = pvap = "—"
+
+        if NPTDMS_OK and tdms_path and os.path.exists(tdms_path):
+            try:
+                tdms = TdmsFile.open(tdms_path)
+                cap     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Capacity [m3/h]")
+                tdh     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "TDH [m]")
+                eff     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Efficiency [%]")
+                abs_pow = tdms_read_scalar_string(tdms, "Ref. Contract Data", "ABS_Power [kW]")
+                speed   = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Speed [rpm]")
+                sg      = tdms_read_scalar_string(tdms, "Ref. Contract Data", "SG Contract")
+                temp    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Temperature [C]")
+                visc    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Viscosity [cP]")
+                npsh    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "NPSH [m]")
+                liquid  = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Liquid")
+
+                cust    = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Customer")
+                po      = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Purchaser Order")
+                end_user= tdms_read_scalar_string(tdms, "Ref. Test Param.", "End User")
+                specs   = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Applic. Specs.")
+
+                item    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Item")
+                pump    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Pump")
+                sn      = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Serial Number_Elenco")
+                imp_draw= tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Drawing")
+                imp_mat = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Material")
+                imp_dia = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Diam Nominal")
+
+                suction     = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Suction [Inch]")
+                discharge   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Discharge [Inch]")
+                watt_const  = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Wattmeter Const.")
+                atmpress    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "AtmPress [m]")
+                knpsh       = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KNPSH [m]")
+                watertemp   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "WaterTemp [C]")
+                kventuri    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KVenturi")
+                # pvap/motor_num/flowmeter: TBD
+                try: tdms.close()
+                except Exception: pass
+            except Exception:
+                pass
+
+        contractual = tk.LabelFrame(blocks, text="Contractual Data", bg="#ffffff")
+        contractual.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        contractual.columnconfigure(0, weight=1); contractual.columnconfigure(1, weight=1)
+
+        col1 = tk.Frame(contractual, bg="#ffffff"); col1.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        _kv_row(col1, "Capacity [m³/h]", cap); _kv_row(col1, "TDH [m]", tdh); _kv_row(col1, "Efficiency", eff)
+        _kv_row(col1, "ABS_Power [kW]", abs_pow); _kv_row(col1, "Speed [rpm]", speed); _kv_row(col1, "SG", sg)
+        _kv_row(col1, "Temperature [°C]", "—" if temp == "—" else temp)
+        _kv_row(col1, "Viscosity [cP]", visc); _kv_row(col1, "NPSH [m]", npsh); _kv_row(col1, "Liquid", liquid)
+
+        col2 = tk.Frame(contractual, bg="#ffffff"); col2.grid(row=0, column=1, sticky="nsew", padx=(8,0))
+        _kv_row(col2, "FSG ORDER", job_dash if job_dash and job_dash != "—" else "—")
+        _kv_row(col2, "CUSTOMER", cust); _kv_row(col2, "P.O.", po)
+        _kv_row(col2, "End User", end_user); _kv_row(col2, "Item", item)
+        pump_model = pump if pump and pump != "—" else (values[3] if len(values) > 3 else "—")
+        _kv_row(col2, "Pump", pump_model)
+        _kv_row(col2, "S. N.", sn); _kv_row(col2, "Imp. Draw.", imp_draw); _kv_row(col2, "Imp. Mat.", imp_mat)
+        _kv_row(col2, "Imp Dia [mm]", imp_dia); _kv_row(col2, "Specs", specs)
+
+        loop = tk.LabelFrame(blocks, text="Loop Details", bg="#ffffff")
+        loop.grid(row=0, column=1, sticky="nsew", padx=(8,0))
+        tk.Label(loop, text="Test performed with :", bg="#ffffff", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(6,2))
+        for line in [
+            f"CALIBRATED MOTOR (num —)",
+            f"FLOWMETER (FLOWMETER —)",
+            f"Suction [Inch] {suction}",
+            f"Discharge [Inch] {discharge}",
+            f"Wattmeter Const. {watt_const}",
+            f"AtmPress [m] {atmpress}",
+            f"KNPSH [m] {knpsh}",
+            f"WaterTemp [°C] {watertemp}",
+            f"Kventuri {kventuri}",
+            f"PVap —",
+        ]:
+            tk.Label(loop, text=line, bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="w", padx=8, pady=2)
+
+    # --- renderer: Tre tabelle -------------------------------------------------------
+    def render_tables(tdms_path: str):
+        for w in tables_row.winfo_children():
+            w.destroy()
+
+        # modelli vuoti se nessun file
+        perf = read_performance_tables_dynamic(tdms_path, test_index=0) if tdms_path else {
+            "Recorded": {"columns": [], "units": [], "rows": []},
+            "Calc": {"columns": [], "units": [], "rows": []},
+            "Converted": {"columns": [], "units": [], "rows": []},
+        }
+        rec_cols, rec_units, rec_rows    = perf["Recorded"]["columns"],   perf["Recorded"]["units"],   perf["Recorded"]["rows"]
+        calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
+        conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
+
+        def _make_table(parent, title, cols, units):
+            lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
+            lf.columnconfigure(0, weight=1); lf.rowconfigure(0, weight=1)
+            tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
+            if not cols:
+                tv.heading("—", text="—"); tv.column("—", width=120, anchor="center", stretch=True)
+            else:
+                for c_name in cols:
+                    tv.heading(c_name, text=c_name)
+                    base_w = min(max(110, len(c_name)*7), 320)
+                    tv.column(c_name, width=base_w, anchor="center", stretch=True)
+            tv.grid(row=0, column=0, sticky="nsew")
+            tv.tag_configure("units_row", background="#EFEFEF")
+            if cols:
+                tv.insert("", "end", iid="units", values=tuple(u or "" for u in units), tags=("units_row",))
+            return tv, lf
+
+        # Recorded (titoli senza unità)
+        tv_rec, lf_rec = _make_table(tables_row, "Recorded Data", rec_cols, rec_units)
+        lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        # Calc (invariata)
+        tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
+        lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
+        # Converted (invariata)
+        tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
+        lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
+
+        # Righe dati (p001, p002, ...)
+        for idx, vals in enumerate(rec_rows, start=1):
+            tv_rec.insert("", "end", iid=f"p{idx:03d}", values=vals)
+        for idx, vals in enumerate(calc_rows, start=1):
+            tv_calc.insert("", "end", iid=f"p{idx:03d}", values=vals)
+        for idx, vals in enumerate(conv_rows, start=1):
+            tv_conv.insert("", "end", iid=f"p{idx:03d}", values=vals)
+
+        # Sync selezione (ignora 'units')
+        sync_state = {"syncing": False, "current_iid": None}
+
+        def _apply_sync(iid, origin):
+            if not iid or iid == "units":
+                return
+            for tv in (tv_rec, tv_calc, tv_conv):
+                if tv is origin:
+                    continue
+                try:
+                    if not tv.exists(iid):
+                        continue
+                    cur = tv.selection()
+                    if cur and cur[0] == iid:
+                        continue
+                    tv.selection_set(iid); tv.focus(iid); tv.see(iid)
+                except Exception:
+                    pass
+
+        def _on_select(src_tv, _e=None):
+            if sync_state["syncing"]:
+                return
+            try:
+                sel = src_tv.selection()
+                iid = sel[0] if sel else None
+            except Exception:
+                iid = None
+            if not iid or iid == "units" or sync_state["current_iid"] == iid:
+                return
+            sync_state["syncing"] = True
+            sync_state["current_iid"] = iid
+            win.after_idle(lambda: (_apply_sync(iid, src_tv), sync_state.update(syncing=False)))
+
+        tv_rec.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_rec, e))
+        tv_calc.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_calc, e))
+        tv_conv.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_conv, e))
+
+        # Seleziona prima riga dati se c'è
+        try:
+            first_iid = next(i for i in tv_rec.get_children() if i != "units")
+            tv_rec.selection_set(first_iid); tv_rec.focus(first_iid); tv_rec.see(first_iid)
+        except StopIteration:
+            pass
+
+    # --- handler: Carica TDMS --------------------------------------------------------
+    def do_load_tdms():
+        path = filedialog.askopenfilename(
+            title="Seleziona un file TDMS",
+            filetypes=[("TDMS files", "*.tdms"), ("Tutti i file", "*.*")]
+        )
+        if not path:
+            return
+        state["tdms_path"] = path
+        render_contract_and_loop(state["tdms_path"])
+        render_tables(state["tdms_path"])
+
+    # Render iniziale: NESSUN caricamento automatico
+    render_contract_and_loop(state["tdms_path"])
+    render_tables(state["tdms_path"])
+
+    # Footer
+    footer = tk.Frame(tab, bg="#ffffff")
+    footer.grid(row=2, column=0, sticky="ew", padx=16, pady=(8,16))
+    for i in range(4):
+        footer.columnconfigure(i, weight=1, uniform="btns")
+
+    def do_open_folder():
+        path = state.get("tdms_path")
+        if not path:
+            messagebox.showwarning("Cartella", "Nessun file TDMS caricato."); return
+        if sys.platform.startswith("win"):
+            import subprocess
+            try: subprocess.run(["explorer", "/select,", path], check=False)
+            except Exception: subprocess.run(["explorer", os.path.dirname(path)], check=False)
+        elif sys.platform == "darwin":
+            import subprocess
+            try: subprocess.run(["open", "-R", path], check=False)
+            except Exception: subprocess.run(["open", os.path.dirname(path)], check=False)
+        else:
+            import subprocess
+            subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
+
+    def do_open_tdms():
+        path = state.get("tdms_path")
+        if not path:
+            messagebox.showwarning("File TDMS", "Nessun file TDMS caricato."); return
+        _open_file_with_os(path)
+
+    def _export_pdf():
+        if not REPORTLAB_OK:
+            messagebox.showinfo("Export PDF", "ReportLab non è installato.\nInstalla con: pip install reportlab"); return
+        tdms_basename = os.path.basename(state.get("tdms_path") or "")
+        default_name = f"TestCertificate_{cert_num or 'N'}_{test_date or 'date'}.pdf"
+        pdf_path = filedialog.asksaveasfilename(title="Esporta PDF", defaultextension=".pdf",
+                                               initialfile=default_name, filetypes=[("PDF","*.pdf")])
+        if not pdf_path: return
+        meta_lines = [
+            f"Certificate No.: {cert_num or '—'}",
+            f"Job: {job_dash or '—'}",
+            f"Pump: {values[3] if len(values) > 3 else '—'}",
+            f"Test Date: {test_date or '—'}",
+            f"File: {tdms_basename}",
+        ]
+        try:
+            _export_pdf_placeholder(pdf_path, "TEST CERTIFICATE", meta_lines)
+            messagebox.showinfo("Export PDF", f"PDF esportato:\n{pdf_path}")
+        except Exception as e:
+            messagebox.showerror("Export PDF", f"Errore durante l'export:\n{e}")
+
+    tk.Button(footer, text="Apri cartella", command=do_open_folder, width=14)\
+        .grid(row=0, column=0, sticky="ew", padx=6)
+    tk.Button(footer, text="Apri file TDMS", command=do_open_tdms, width=14)\
+        .grid(row=0, column=1, sticky="ew", padx=6)
+    tk.Button(footer, text="Esporta PDF…", command=_export_pdf, width=14)\
+        .grid(row=0, column=2, sticky="ew", padx=6)
+    tk.Button(footer, text="Chiudi", command=win.destroy, width=12)\
+        .grid(row=0, column=3, sticky="ew", padx=(6,0))
+
+
+# (opzionale) piccolo demo standalone:
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo("Certificate View", "Questo modulo espone open_detail_window(root, columns, values, meta).\n"
+                        "Apri la finestra e usa “Carica TDMS…” per scegliere il file.")
+    root.destroy()
