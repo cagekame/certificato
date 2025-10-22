@@ -6,6 +6,7 @@ import math
 from collections import defaultdict, OrderedDict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from tkinter import font as tkfont
 
 # nptdms
 try:
@@ -684,6 +685,15 @@ def open_detail_window(root, columns, values, meta):
         calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
         conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
 
+        heading_font = tkfont.nametofont("TkHeadingFont")
+        cell_font = tkfont.nametofont("TkDefaultFont")
+
+        def _column_base_width(col_title: str, col_units: str) -> int:
+            head_w = heading_font.measure(col_title or "")
+            unit_w = cell_font.measure(col_units or "")
+            base = max(head_w, unit_w) + 24  # padding for sort indicator / spacing
+            return max(base, 120)
+
         def _make_table(parent, title, cols, units):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
             lf.columnconfigure(0, weight=1); lf.rowconfigure(0, weight=1)
@@ -691,10 +701,11 @@ def open_detail_window(root, columns, values, meta):
             if not cols:
                 tv.heading("—", text="—"); tv.column("—", width=120, anchor="center", stretch=True)
             else:
-                for c_name in cols:
+                for idx, c_name in enumerate(cols):
                     tv.heading(c_name, text=c_name)
-                    base_w = min(max(110, len(c_name)*7), 320)
-                    tv.column(c_name, width=base_w, anchor="center", stretch=True)
+                    unit_val = units[idx] if idx < len(units) else ""
+                    base_w = min(_column_base_width(c_name, unit_val), 420)
+                    tv.column(c_name, width=base_w, minwidth=base_w, anchor="center", stretch=True)
             tv.grid(row=0, column=0, sticky="nsew")
             tv.tag_configure("units_row", background="#EFEFEF")
             if cols:
