@@ -186,14 +186,9 @@ def _mean_all_strict(data):
 
 def _fmt_num(x):
     try:
-        f = float(x)
+        return f"{float(x):g}"
     except Exception:
         return str(x)
-    if not math.isfinite(f):
-        return str(x)
-    rounded = round(f, 3)
-    text = f"{rounded:.3f}".rstrip("0").rstrip(".")
-    return text if text else "0"
 
 def _collect_perf_points(tdms, test_index: int = 0):
     points = defaultdict(lambda: {"Recorded": [], "Calc": [], "Converted": []})
@@ -464,7 +459,7 @@ def open_detail_window(root, columns, values, meta):
     tables_row = tk.Frame(body, bg="#ffffff")
     tables_row.pack(fill="both", expand=True, padx=16, pady=(8,16))
     for c in range(3):
-        tables_row.columnconfigure(c, weight=1, uniform="tables")
+        tables_row.columnconfigure(c, weight=0)  # niente autoscale: decidiamo noi le minsize
     tables_row.rowconfigure(0, weight=1)
 
     # --- renderer: Contractual + Loop -------------------------------------------------
@@ -553,13 +548,28 @@ def open_detail_window(root, columns, values, meta):
     def _measure_title(widget, text: str) -> int:
         # usa il font dell'header della Treeview se disponibile, altrimenti default
         try:
-            style = ttk.Style(widget)
+            style = ttk.Style()  # più robusto di Style(widget)
             font_name = style.lookup("Treeview.Heading", "font") or "TkDefaultFont"
         except Exception:
             font_name = "TkDefaultFont"
         fnt = tkfont.nametofont(font_name)
         # un po' di padding ai lati per non tagliare le lettere
         return fnt.measure(text if text else " ") + 24
+
+    # ---- helper: ridistribuzione equa nelle colonne della treeview --------------
+    def _spread_even_in_tv(tv, cols, minwidths, total_target):
+        if not cols:
+            tv.column("—", width=max(minwidths[0], total_target),
+                      minwidth=minwidths[0], stretch=False, anchor="center")
+            return
+        base_sum = sum(minwidths)
+        extra = max(0, total_target - base_sum)
+        n = len(cols)
+        add_each = extra // n
+        rem = extra % n
+        for i, (c, wmin) in enumerate(zip(cols, minwidths)):
+            w = wmin + add_each + (1 if i < rem else 0)
+            tv.column(c, width=w, minwidth=wmin, stretch=False, anchor="center")
 
     # --- renderer: Tre tabelle -------------------------------------------------------
     def render_tables(tdms_path: str):
@@ -575,24 +585,31 @@ def open_detail_window(root, columns, values, meta):
         calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
         conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
 
+        # Per memorizzare meta delle 3 tabelle
+        metas = []  # ciascuno: {"frame","tv","cols","minwidths","base_sum"}
+
         def _make_table(parent, title, cols, units):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
+            # il frame deve poter espandere la treeview
             lf.rowconfigure(0, weight=1)
             lf.columnconfigure(0, weight=1)
 
-            # Treeview senza scrollbar orizzontale: il frame segue la larghezza delle colonne
+            # Treeview senza scrollbar orizzontale
             tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
 
+            minwidths = []
             if not cols:
                 tv.heading("—", text="—")
                 minw = _measure_title(tv, "—")
-                tv.column("—", minwidth=minw, width=minw, anchor="center", stretch=True)
+                tv.column("—", minwidth=minw, width=minw, anchor="center", stretch=False)
+                minwidths = [minw]
             else:
                 for c_name in cols:
                     tv.heading(c_name, text=c_name)
-                    # larghezza non inferiore al titolo visualizzato; le colonne possono allungarsi
+                    # larghezza non inferiore al titolo visualizzato
                     minw = _measure_title(tv, c_name)
-                    tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=True)
+                    tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=False)
+                    minwidths.append(minw)
 
             tv.grid(row=0, column=0, sticky="nsew")
             tv.tag_configure("units_row", background="#EFEFEF")
@@ -601,17 +618,22 @@ def open_detail_window(root, columns, values, meta):
             if cols:
                 tv.insert("", "end", iid="units", values=tuple(u or "" for u in units), tags=("units_row",))
 
+            metas.append({
+                "frame": lf, "tv": tv,
+                "cols": cols if cols else ["—"],
+                "minwidths": minwidths,
+                "base_sum": sum(minwidths)
+            })
             return tv, lf
 
         # build tabelle
         tv_rec, lf_rec   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
-        lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
-
         tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
-        lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
-
         tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
-        lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
+
+        lf_rec.grid(row=0, column=0, sticky="nw", padx=(0,8))
+        lf_calc.grid(row=0, column=1, sticky="nw", padx=8)
+        lf_conv.grid(row=0, column=2, sticky="nw", padx=(8,0))
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
@@ -658,6 +680,45 @@ def open_detail_window(root, columns, values, meta):
         tv_calc.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_calc, e))
         tv_conv.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_conv, e))
 
+        # ---- LAYOUT: riempi lo spazio residuo a livello di FRAME e ridistribuisci le colonne
+        def _post_fill_layout():
+            if not metas:
+                return
+            tables_row.update_idletasks()
+            container_w = tables_row.winfo_width()
+
+            # Padding orizzontale tra i frame: (0,8), 8, (8,0) => 16px totali
+            gaps = 16
+
+            # Larghezza minima necessaria per contenere i titoli/colonne (somma minwidth)
+            base_total = sum(m["base_sum"] for m in metas) + gaps
+
+            if base_total <= container_w:
+                # c'è spazio residuo: dividilo per 3 e aumentiamo la minsize (larghezza) di ogni colonna griglia
+                extra = container_w - base_total
+                extra_each = extra // 3
+                targets = [m["base_sum"] + extra_each for m in metas]
+            else:
+                # non c'è abbastanza spazio: allarghiamo la finestra e usiamo le larghezze base
+                need = base_total - container_w
+                new_w = win.winfo_width() + need + 32  # piccolo margine
+                win.geometry(f"{new_w}x{win.winfo_height()}")
+                win.update_idletasks()
+                targets = [m["base_sum"] for m in metas]
+
+            # Applica ai FRAME agendo sulla griglia del contenitore (minsize colonne 0,1,2)
+            for col, target in enumerate(targets):
+                tables_row.grid_columnconfigure(col, minsize=target)
+
+            # Dentro ogni frame, ridistribuisci equamente le colonne della Treeview
+            for m, target in zip(metas, targets):
+                _spread_even_in_tv(m["tv"], m["cols"], m["minwidths"], target)
+
+        # rilayout dopo riempimento e al resize del contenitore
+        win.after_idle(_post_fill_layout)
+        tables_row.bind("<Configure>", lambda e: win.after_idle(_post_fill_layout))
+
+        # selezione iniziale se disponibile
         try:
             first_iid = next(i for i in tv_rec.get_children() if i != "units")
             tv_rec.selection_set(first_iid); tv_rec.focus(first_iid); tv_rec.see(first_iid)
@@ -745,5 +806,5 @@ if __name__ == "__main__":
     root.withdraw()
     messagebox.showinfo("Certificate View",
         "Apri la finestra e usa “Carica TDMS…” per scegliere il file.\n"
-        "Ogni tabella adatta le colonne alla larghezza del titolo e puoi scorrere orizzontalmente.")
+        "Le tre tabelle si adattano e riempiono tutta la riga senza scrollbar.")
     root.destroy()
