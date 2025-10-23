@@ -6,7 +6,7 @@ import math
 from collections import defaultdict, OrderedDict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from tkinter import font as tkfont
+import tkinter.font as tkfont  # <— per misurare i titoli
 
 # nptdms
 try:
@@ -159,10 +159,6 @@ def _find_unit(raw: str):
     return None
 
 def _mean_all_strict(data):
-    """
-    Media su TUTTI i campioni: non-finito -> 0. Ritorna float.
-    Se il canale non è numerico, ritorna 0.0.
-    """
     if NUMPY_OK:
         try:
             a = np.asarray(data, dtype=float)
@@ -175,7 +171,6 @@ def _mean_all_strict(data):
         if mask.any():
             a[mask] = 0.0
         return float(np.mean(a))
-    # fallback
     seq = data if hasattr(data, "__iter__") and not isinstance(data, (str, bytes, bytearray)) else [data]
     total = 0.0
     n = 0
@@ -186,8 +181,6 @@ def _mean_all_strict(data):
             f = 0.0
         if math.isfinite(f):
             total += f
-        else:
-            total += 0.0
         n += 1
     return (total / n) if n else 0.0
 
@@ -198,9 +191,6 @@ def _fmt_num(x):
         return str(x)
 
 def _collect_perf_points(tdms, test_index: int = 0):
-    """
-    -> points[point]['Recorded'/'Calc'/'Converted'] = [TdmsGroup, ...]
-    """
     points = defaultdict(lambda: {"Recorded": [], "Calc": [], "Converted": []})
     for g in tdms.groups():
         m = GROUP_RE.match(g.name or "")
@@ -213,14 +203,11 @@ def _collect_perf_points(tdms, test_index: int = 0):
         points[p][k].append(g)
     return dict(points)
 
-# ---------- MEDIA STREAMING: robusto per canali molto lunghi ----------
 def _nan_sum_and_count(a):
-    """Ritorna (somma, conteggio) considerando non-finiti come esclusi (non contati)."""
     if NUMPY_OK:
         try:
             finite = np.isfinite(a)
         except Exception:
-            # se 'a' non è array numpy, prova a convertirlo
             try:
                 a = np.asarray(list(a), dtype=float)
                 finite = np.isfinite(a)
@@ -231,7 +218,6 @@ def _nan_sum_and_count(a):
         s = float(np.sum(a[finite]))
         c = int(np.count_nonzero(finite))
         return s, c
-    # fallback pure-Python
     s = 0.0; c = 0
     for v in a:
         try:
@@ -243,15 +229,9 @@ def _nan_sum_and_count(a):
     return s, c
 
 def _mean_channel_fast(ch, chunk_size=2_000_000, use_float32=True):
-    """
-    Media su TUTTI i campioni del canale 'ch', a chunk, con gestione NaN/Inf.
-    Non carica mai l'intero vettore in RAM. Ritorna float (0.0 se nessun numerico).
-    """
-    # prova a conoscere la lunghezza
     try:
         n = len(ch)
     except Exception:
-        # fallback super-robusto
         try:
             data = ch[:]
         except Exception:
@@ -260,20 +240,19 @@ def _mean_channel_fast(ch, chunk_size=2_000_000, use_float32=True):
 
     total = 0.0
     count = 0
-
     to_dtype = np.float32 if (NUMPY_OK and use_float32) else float
 
     start = 0
     while start < n:
         stop = min(start + chunk_size, n)
         try:
-            part = ch[start:stop]   # nptdms supporta slicing
+            part = ch[start:stop]
         except Exception:
             try:
                 part = ch[:]
             except Exception:
                 part = getattr(ch, "data", [])
-            start = n  # interrompi il loop
+            start = n
         else:
             start = stop
 
@@ -292,90 +271,14 @@ def _mean_channel_fast(ch, chunk_size=2_000_000, use_float32=True):
     if count == 0:
         return 0.0
     return total / count
-# ---------------------------------------------------------------------
 
-def _build_kind_model(groups_by_point: dict, kind_name: str):
-    """
-    Dato un dict point -> [TdmsGroup,...] per un 'kind', costruisce:
-      - columns: chiavi dinamiche (Base[_Qual][_unit][__2..]) in ordine di prima occorrenza
-      - units:   unità corrispondenti ("" se assente)
-      - rows:    lista di tuple allineate alle columns, una per point crescente
-    """
-    columns, units, rows = [], [], []
-    seen_cols = set()
+# ===== Builder: colonne SENZA unità e SENZA nome categoria (vale per ogni tabella) =====
+def _build_kind_model_no_unit(groups_by_point: dict):
+    first_seen_order = []
+    preferred_unit = {}
+    max_dups = defaultdict(int)
 
-    # 1) determina colonne globali
-    for p in sorted(groups_by_point.keys()):
-        dup_seq = defaultdict(int)
-        for grp in groups_by_point[p]:
-            for ch in grp.channels():
-                base = _primary_token(ch.name)
-                if base is None:
-                    continue
-                qual = _find_qualifier(ch.name)
-                unit = _find_unit(ch.name)
-                unit_suffix = f"_{unit}" if unit else ""
-                base_key = f"{base}_{qual}{unit_suffix}" if qual else f"{base}{unit_suffix}"
-                key = base_key
-                if key in [k for k in columns] or key in seen_cols:
-                    if any(k == key for k in columns):
-                        dup_seq[base_key] += 1
-                        key = f"{base_key}__{dup_seq[base_key]+1}"
-                if key not in seen_cols:
-                    seen_cols.add(key)
-                    columns.append(key)
-                    units.append(unit or "")
-
-    # 2) costruisci le righe
-    for p in sorted(groups_by_point.keys()):
-        row_map = {}
-        dup_seq = defaultdict(int)
-        for grp in groups_by_point[p]:
-            for ch in grp.channels():
-                base = _primary_token(ch.name)
-                if base is None:
-                    continue
-                qual = _find_qualifier(ch.name)
-                unit = _find_unit(ch.name)
-                unit_suffix = f"_{unit}" if unit else ""
-                base_key = f"{base}_{qual}{unit_suffix}" if qual else f"{base}{unit_suffix}"
-                key = base_key
-                if key in row_map:
-                    dup_seq[base_key] += 1
-                    key = f"{base_key}__{dup_seq[base_key]+1}"
-
-                # media su TUTTI i campioni (streaming a chunk, niente array gigante)
-                try:
-                    mean_val = _mean_channel_fast(ch)
-                except Exception:
-                    try:
-                        data = ch[:]
-                    except Exception:
-                        data = getattr(ch, "data", [])
-                    mean_val = _mean_all_strict(data)
-
-                row_map[key] = _fmt_num(mean_val)
-
-        rows.append(tuple(row_map.get(c, "") for c in columns))
-
-    return columns, units, rows
-
-
-# -------------------- NEW: builder SOLO per Recorded (niente unità nei titoli, niente duplicati fantasma) --------------------
-def _build_recorded_model(groups_by_point: dict):
-    """
-    Costruisce il modello per la tabella Recorded:
-      - Titoli colonna SENZA unità: Base[_Qual] (+ __2, __3... se nello stesso point esistono duplicati)
-      - Unità mostrate solo nella riga 'Units' (prima unità incontrata per quella base)
-      - Niente colonne duplicate fantasma: per ogni Base[_Qual] si crea un numero di colonne pari
-        al massimo di occorrenze trovato tra tutti i point.
-    """
-    # 1) Scansione: conteggio occorrenze per point e prima unità vista per ciascuna base
-    first_seen_order = []             # ordine globale di prima apparizione delle basi
-    preferred_unit = {}               # base -> unit (prima vista)
-    max_dups = defaultdict(int)       # base -> massimo numero di occorrenze tra i point
-
-    def base_no_unit(ch_name: str):
+    def base_key_no_unit(ch_name: str):
         base = _primary_token(ch_name)
         if base is None:
             return None, None
@@ -385,10 +288,10 @@ def _build_recorded_model(groups_by_point: dict):
         return key, unit
 
     for p in sorted(groups_by_point.keys()):
-        counts_this_point = defaultdict(int)  # base -> occorrenze nel point
+        counts_this_point = defaultdict(int)
         for grp in groups_by_point[p]:
             for ch in grp.channels():
-                key, unit = base_no_unit(ch.name)
+                key, unit = base_key_no_unit(ch.name)
                 if key is None:
                     continue
                 counts_this_point[key] += 1
@@ -400,29 +303,25 @@ def _build_recorded_model(groups_by_point: dict):
             if cnt > max_dups[key]:
                 max_dups[key] = cnt
 
-    # 2) Colonne globali nell'ordine di prima apparizione
-    columns = []
-    units = []
+    columns, units = [], []
     for key in first_seen_order:
         n = max(1, max_dups.get(key, 1))
         for i in range(1, n + 1):
-            col_name = key if i == 1 else f"{key}__{i}"
-            columns.append(col_name)
+            col = key if i == 1 else f"{key}__{i}"
+            columns.append(col)
             units.append(preferred_unit.get(key, ""))
 
-    # 3) Righe
     rows = []
     for p in sorted(groups_by_point.keys()):
         seq = defaultdict(int)
         row_map = {}
         for grp in groups_by_point[p]:
             for ch in grp.channels():
-                key, _unit = base_no_unit(ch.name)
+                key, _u = base_key_no_unit(ch.name)
                 if key is None:
                     continue
                 seq[key] += 1
                 col = key if seq[key] == 1 else f"{key}__{seq[key]}"
-
                 try:
                     mean_val = _mean_channel_fast(ch)
                 except Exception:
@@ -431,23 +330,13 @@ def _build_recorded_model(groups_by_point: dict):
                     except Exception:
                         data = getattr(ch, "data", [])
                     mean_val = _mean_all_strict(data)
-
                 row_map[col] = _fmt_num(mean_val)
-
         rows.append(tuple(row_map.get(c, "") for c in columns))
 
     return columns, units, rows
 
 
 def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
-    """
-    Ritorna:
-      {
-        "Recorded":  {"columns": [...], "units": [...], "rows": [tuple,...]},
-        "Calc":      {...},
-        "Converted": {...}
-      }
-    """
     out = {k: {"columns": [], "units": [], "rows": []} for k in KIND_ORDER}
     if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
         return out
@@ -465,21 +354,12 @@ def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
                 if kinds[k]:
                     by_kind[k][p].extend(kinds[k])
 
-        # Recorded: titoli SENZA unità, set colonne coerente (no duplicati fantasma)
-        if by_kind["Recorded"]:
-            cols, units, rows = _build_recorded_model(by_kind["Recorded"])
-            out["Recorded"]["columns"] = cols
-            out["Recorded"]["units"]   = units
-            out["Recorded"]["rows"]    = rows
-
-        # Calc + Converted: invariati (titoli con unità come prima)
-        for k in ("Calc", "Converted"):
+        for k in KIND_ORDER:
             if by_kind[k]:
-                cols, units, rows = _build_kind_model(by_kind[k], k)
+                cols, units, rows = _build_kind_model_no_unit(by_kind[k])
                 out[k]["columns"] = cols
                 out[k]["units"]   = units
                 out[k]["rows"]    = rows
-
         return out
     finally:
         try: tdms.close()
@@ -528,13 +408,11 @@ def open_detail_window(root, columns, values, meta):
     win.minsize(1200, 740)
     win.configure(bg="#f0f0f0")
 
-    # --- dalla dashboard ---
     cert_num   = values[1] if len(values) > 1 else "—"
     test_date  = values[4] if len(values) > 4 else "—"
     job_dash   = values[0] if len(values) > 0 else "—"
     pump_dash  = values[3] if len(values) > 3 else "—"
 
-    # stato runtime: percorso TDMS caricato dall’utente
     state = {"tdms_path": None}
 
     # -------------------- UI layout --------------------
@@ -556,7 +434,7 @@ def open_detail_window(root, columns, values, meta):
     tk.Label(right, text="U.M. System: SI (Metric)", bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="e")
     lbl_date = tk.Label(right, text=f"Test Date: {test_date}", bg="#ffffff", font=("Segoe UI", 10)); lbl_date.pack(anchor="e")
 
-    # Body scroll unico
+    # Body scroll unico (verticale)
     body_wrap = tk.Frame(tab, bg="#ffffff"); body_wrap.grid(row=1, column=0, sticky="nsew")
     body_wrap.columnconfigure(0, weight=1); body_wrap.rowconfigure(0, weight=1)
     canvas = tk.Canvas(body_wrap, highlightthickness=0, bg="#ffffff")
@@ -572,7 +450,7 @@ def open_detail_window(root, columns, values, meta):
     canvas.bind("<Configure>", _on_cfg)
     body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-    # Containers (vuoti all'avvio)
+    # Containers
     blocks = tk.Frame(body, bg="#ffffff")
     blocks.pack(fill="x", padx=16, pady=(8,8))
     blocks.columnconfigure(0, weight=1)
@@ -589,11 +467,10 @@ def open_detail_window(root, columns, values, meta):
         for w in blocks.winfo_children():
             w.destroy()
 
-        # default
         cap = tdh = eff = abs_pow = speed = sg = temp = visc = npsh = liquid = "—"
         cust = po = end_user = specs = "—"
         item = pump = sn = imp_draw = imp_mat = imp_dia = "—"
-        motor_num = flowmeter = suction = discharge = watt_const = atmpress = knpsh = watertemp = kventuri = pvap = "—"
+        suction = discharge = watt_const = atmpress = knpsh = watertemp = kventuri = "—"
 
         if NPTDMS_OK and tdms_path and os.path.exists(tdms_path):
             try:
@@ -628,7 +505,7 @@ def open_detail_window(root, columns, values, meta):
                 knpsh       = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KNPSH [m]")
                 watertemp   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "WaterTemp [C]")
                 kventuri    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KVenturi")
-                # pvap/motor_num/flowmeter: TBD
+
                 try: tdms.close()
                 except Exception: pass
             except Exception:
@@ -657,8 +534,6 @@ def open_detail_window(root, columns, values, meta):
         loop.grid(row=0, column=1, sticky="nsew", padx=(8,0))
         tk.Label(loop, text="Test performed with :", bg="#ffffff", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(6,2))
         for line in [
-            f"CALIBRATED MOTOR (num —)",
-            f"FLOWMETER (FLOWMETER —)",
             f"Suction [Inch] {suction}",
             f"Discharge [Inch] {discharge}",
             f"Wattmeter Const. {watt_const}",
@@ -666,16 +541,26 @@ def open_detail_window(root, columns, values, meta):
             f"KNPSH [m] {knpsh}",
             f"WaterTemp [°C] {watertemp}",
             f"Kventuri {kventuri}",
-            f"PVap —",
         ]:
             tk.Label(loop, text=line, bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="w", padx=8, pady=2)
+
+    # ------- util: misura pixel del titolo e calcolo min larghezze colonne --------
+    def _measure_title(widget, text: str) -> int:
+        # usa il font dell'header della Treeview se disponibile, altrimenti default
+        try:
+            style = ttk.Style(widget)
+            font_name = style.lookup("Treeview.Heading", "font") or "TkDefaultFont"
+        except Exception:
+            font_name = "TkDefaultFont"
+        fnt = tkfont.nametofont(font_name)
+        # un po' di padding ai lati per non tagliare le lettere
+        return fnt.measure(text if text else " ") + 24
 
     # --- renderer: Tre tabelle -------------------------------------------------------
     def render_tables(tdms_path: str):
         for w in tables_row.winfo_children():
             w.destroy()
 
-        # modelli vuoti se nessun file
         perf = read_performance_tables_dynamic(tdms_path, test_index=0) if tdms_path else {
             "Recorded": {"columns": [], "units": [], "rows": []},
             "Calc": {"columns": [], "units": [], "rows": []},
@@ -685,44 +570,58 @@ def open_detail_window(root, columns, values, meta):
         calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
         conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
 
-        heading_font = tkfont.nametofont("TkHeadingFont")
-        cell_font = tkfont.nametofont("TkDefaultFont")
-
-        def _column_base_width(col_title: str, col_units: str) -> int:
-            head_w = heading_font.measure(col_title or "")
-            unit_w = cell_font.measure(col_units or "")
-            base = max(head_w, unit_w) + 24  # padding for sort indicator / spacing
-            return max(base, 120)
-
         def _make_table(parent, title, cols, units):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
             lf.columnconfigure(0, weight=1); lf.rowconfigure(0, weight=1)
+
+            # Treeview + scrollbar orizzontale dedicata
             tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
+            hsb = ttk.Scrollbar(lf, orient="horizontal", command=tv.xview)
+            tv.configure(xscrollcommand=hsb.set)
+
             if not cols:
-                tv.heading("—", text="—"); tv.column("—", width=120, anchor="center", stretch=True)
+                tv.heading("—", text="—")
+                minw = _measure_title(tv, "—")
+                tv.column("—", minwidth=minw, width=minw, anchor="center", stretch=True)
             else:
-                for idx, c_name in enumerate(cols):
+                for c_name in cols:
                     tv.heading(c_name, text=c_name)
-                    unit_val = units[idx] if idx < len(units) else ""
-                    base_w = min(_column_base_width(c_name, unit_val), 420)
-                    tv.column(c_name, width=base_w, minwidth=base_w, anchor="center", stretch=True)
+                    # larghezza non inferiore al titolo visualizzato; le colonne possono allungarsi
+                    minw = _measure_title(tv, c_name)
+                    tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=True)
+
             tv.grid(row=0, column=0, sticky="nsew")
+            hsb.grid(row=1, column=0, sticky="ew")  # barra di scorrimento orizzontale
             tv.tag_configure("units_row", background="#EFEFEF")
+
+            # riga unità
             if cols:
                 tv.insert("", "end", iid="units", values=tuple(u or "" for u in units), tags=("units_row",))
-            return tv, lf
 
-        # Recorded (titoli senza unità)
-        tv_rec, lf_rec = _make_table(tables_row, "Recorded Data", rec_cols, rec_units)
+            # ritorno anche la funzione che (ri)calcola la larghezza “logica” totale
+            def _total_width():
+                total = 0
+                for c in (cols or ("—",)):
+                    try:
+                        total += int(tv.column(c, option="width"))
+                    except Exception:
+                        pass
+                # padding interno per evitare scroll “a scatti”
+                return total + 8
+
+            return tv, lf, _total_width
+
+        # build tabelle
+        tv_rec, lf_rec, rec_total_w   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
         lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
-        # Calc (invariata)
-        tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
+
+        tv_calc, lf_calc, calc_total_w = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
         lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
-        # Converted (invariata)
-        tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
+
+        tv_conv, lf_conv, conv_total_w = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
         lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
 
-        # Righe dati (p001, p002, ...)
+        # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
             tv_rec.insert("", "end", iid=f"p{idx:03d}", values=vals)
         for idx, vals in enumerate(calc_rows, start=1):
@@ -730,7 +629,24 @@ def open_detail_window(root, columns, values, meta):
         for idx, vals in enumerate(conv_rows, start=1):
             tv_conv.insert("", "end", iid=f"p{idx:03d}", values=vals)
 
-        # Sync selezione (ignora 'units')
+        # quando l'utente allunga una colonna col drag, aggiorniamo la “larghezza logica”
+        def _bind_resize_logic(tv, total_w_fn):
+            def _on_button_release(_e=None):
+                # forza refresh scrollbar/viewport: lo xview tiene conto della somma width colonne
+                tv.update_idletasks()
+                # non serve settare altro: l'hscroll si aggiorna da solo via xscrollcommand
+                # questa funzione esiste solo per essere chiamata dopo i drag
+                return
+            # rilascio mouse dopo drag header/colonna
+            tv.bind("<ButtonRelease-1>", _on_button_release, add="+")
+            # anche dopo eventuali reflow configurazione
+            tv.bind("<Configure>", lambda _e: tv.after_idle(_on_button_release), add="+")
+
+        _bind_resize_logic(tv_rec,  rec_total_w)
+        _bind_resize_logic(tv_calc, calc_total_w)
+        _bind_resize_logic(tv_conv, conv_total_w)
+
+        # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
 
         def _apply_sync(iid, origin):
@@ -767,7 +683,6 @@ def open_detail_window(root, columns, values, meta):
         tv_calc.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_calc, e))
         tv_conv.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_conv, e))
 
-        # Seleziona prima riga dati se c'è
         try:
             first_iid = next(i for i in tv_rec.get_children() if i != "units")
             tv_rec.selection_set(first_iid); tv_rec.focus(first_iid); tv_rec.see(first_iid)
@@ -829,7 +744,7 @@ def open_detail_window(root, columns, values, meta):
         meta_lines = [
             f"Certificate No.: {cert_num or '—'}",
             f"Job: {job_dash or '—'}",
-            f"Pump: {values[3] if len(values) > 3 else '—'}",
+            f"Pump: {pump_dash or '—'}",
             f"Test Date: {test_date or '—'}",
             f"File: {tdms_basename}",
         ]
@@ -853,6 +768,7 @@ def open_detail_window(root, columns, values, meta):
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
-    messagebox.showinfo("Certificate View", "Questo modulo espone open_detail_window(root, columns, values, meta).\n"
-                        "Apri la finestra e usa “Carica TDMS…” per scegliere il file.")
+    messagebox.showinfo("Certificate View",
+        "Apri la finestra e usa “Carica TDMS…” per scegliere il file.\n"
+        "Ogni tabella adatta le colonne alla larghezza del titolo e puoi scorrere orizzontalmente.")
     root.destroy()
