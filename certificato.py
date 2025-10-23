@@ -186,9 +186,14 @@ def _mean_all_strict(data):
 
 def _fmt_num(x):
     try:
-        return f"{float(x):g}"
+        f = float(x)
     except Exception:
         return str(x)
+    if not math.isfinite(f):
+        return str(x)
+    rounded = round(f, 3)
+    text = f"{rounded:.3f}".rstrip("0").rstrip(".")
+    return text if text else "0"
 
 def _collect_perf_points(tdms, test_index: int = 0):
     points = defaultdict(lambda: {"Recorded": [], "Calc": [], "Converted": []})
@@ -459,7 +464,7 @@ def open_detail_window(root, columns, values, meta):
     tables_row = tk.Frame(body, bg="#ffffff")
     tables_row.pack(fill="both", expand=True, padx=16, pady=(8,16))
     for c in range(3):
-        tables_row.columnconfigure(c, weight=0)
+        tables_row.columnconfigure(c, weight=1, uniform="tables")
     tables_row.rowconfigure(0, weight=1)
 
     # --- renderer: Contractual + Loop -------------------------------------------------
@@ -573,6 +578,7 @@ def open_detail_window(root, columns, values, meta):
         def _make_table(parent, title, cols, units):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
             lf.rowconfigure(0, weight=1)
+            lf.columnconfigure(0, weight=1)
 
             # Treeview senza scrollbar orizzontale: il frame segue la larghezza delle colonne
             tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
@@ -588,7 +594,7 @@ def open_detail_window(root, columns, values, meta):
                     minw = _measure_title(tv, c_name)
                     tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=True)
 
-            tv.grid(row=0, column=0, sticky="ns")
+            tv.grid(row=0, column=0, sticky="nsew")
             tv.tag_configure("units_row", background="#EFEFEF")
 
             # riga unità
@@ -599,13 +605,13 @@ def open_detail_window(root, columns, values, meta):
 
         # build tabelle
         tv_rec, lf_rec   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
-        lf_rec.grid(row=0, column=0, sticky="nw", padx=(0,8))
+        lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
 
         tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
-        lf_calc.grid(row=0, column=1, sticky="nw", padx=8)
+        lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
 
         tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
-        lf_conv.grid(row=0, column=2, sticky="nw", padx=(8,0))
+        lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
