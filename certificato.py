@@ -452,7 +452,7 @@ def open_detail_window(root, columns, values, meta):
 
     # Containers
     blocks = tk.Frame(body, bg="#ffffff")
-    blocks.pack(fill="x", padx=16, pady=(8,8))
+    blocks.pack(fill="x", expand=True, padx=16, pady=(8,8))
     blocks.columnconfigure(0, weight=1)
     blocks.columnconfigure(1, weight=1)
 
