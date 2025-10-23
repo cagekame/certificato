@@ -631,9 +631,9 @@ def open_detail_window(root, columns, values, meta):
         tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
         tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
 
-        lf_rec.grid(row=0, column=0, sticky="nw", padx=(0,8))
-        lf_calc.grid(row=0, column=1, sticky="nw", padx=8)
-        lf_conv.grid(row=0, column=2, sticky="nw", padx=(8,0))
+        lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
+        lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
@@ -693,26 +693,34 @@ def open_detail_window(root, columns, values, meta):
             # Larghezza minima necessaria per contenere i titoli/colonne (somma minwidth)
             base_total = sum(m["base_sum"] for m in metas) + gaps
 
-            if base_total <= container_w:
-                # c'è spazio residuo: dividilo per 3 e aumentiamo la minsize (larghezza) di ogni colonna griglia
-                extra = container_w - base_total
-                extra_each = extra // 3
-                targets = [m["base_sum"] + extra_each for m in metas]
-            else:
-                # non c'è abbastanza spazio: allarghiamo la finestra e usiamo le larghezze base
+            if base_total > container_w:
+                # non c'è abbastanza spazio: allarghiamo la finestra e riproviamo
                 need = base_total - container_w
                 new_w = win.winfo_width() + need + 32  # piccolo margine
                 win.geometry(f"{new_w}x{win.winfo_height()}")
                 win.update_idletasks()
-                targets = [m["base_sum"] for m in metas]
+                tables_row.update_idletasks()
+                container_w = tables_row.winfo_width()
+
+            last_frame = metas[-1]["frame"]
+            last_right = last_frame.winfo_x() + last_frame.winfo_width()
+            leftover = max(0, container_w - last_right)
+
+            share, remainder = divmod(leftover, len(metas))
+
+            targets = []
+            for idx, meta in enumerate(metas):
+                frame_w = max(meta["frame"].winfo_width(), meta["base_sum"])
+                bonus = share + (1 if idx < remainder else 0)
+                targets.append(frame_w + bonus)
 
             # Applica ai FRAME agendo sulla griglia del contenitore (minsize colonne 0,1,2)
             for col, target in enumerate(targets):
                 tables_row.grid_columnconfigure(col, minsize=target)
 
             # Dentro ogni frame, ridistribuisci equamente le colonne della Treeview
-            for m, target in zip(metas, targets):
-                _spread_even_in_tv(m["tv"], m["cols"], m["minwidths"], target)
+            for meta, target in zip(metas, targets):
+                _spread_even_in_tv(meta["tv"], meta["cols"], meta["minwidths"], target)
 
         # rilayout dopo riempimento e al resize del contenitore
         win.after_idle(_post_fill_layout)
