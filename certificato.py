@@ -615,6 +615,46 @@ def open_detail_window(root, columns, values, meta):
         for idx, vals in enumerate(conv_rows, start=1):
             tv_conv.insert("", "end", iid=f"p{idx:03d}", values=vals)
 
+        def _total_pad(value) -> int:
+            if isinstance(value, str):
+                parts = value.split()
+            elif isinstance(value, (tuple, list)):
+                parts = list(value)
+            else:
+                parts = [value]
+            parts = [int(float(p)) for p in parts if str(p).strip()]
+            if not parts:
+                return 0
+            if len(parts) == 1:
+                return parts[0] * 2
+            return parts[0] + parts[1]
+
+        def _enforce_form_width():
+            try:
+                win.update_idletasks()
+            except Exception:
+                return
+
+            frames = [lf for lf in (lf_rec, lf_calc, lf_conv) if lf.winfo_ismapped()]
+            if not frames:
+                return
+
+            tables_width = sum(f.winfo_reqwidth() for f in frames)
+            grid_padding = sum(_total_pad(f.grid_info().get("padx", 0)) for f in frames)
+            pack_padding = _total_pad(tables_row.pack_info().get("padx", 0)) if tables_row.winfo_manager() == "pack" else 0
+
+            required_width = tables_width + grid_padding + pack_padding
+            min_width = max(1200, required_width)
+
+            win.minsize(min_width, 740)
+
+            current_width = max(win.winfo_width(), win.winfo_reqwidth())
+            if current_width < min_width:
+                current_height = max(win.winfo_height(), win.winfo_reqheight(), 740)
+                win.geometry(f"{min_width}x{current_height}")
+
+        _enforce_form_width()
+
         # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
 
