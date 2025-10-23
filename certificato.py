@@ -400,6 +400,32 @@ def _open_file_with_os(path: str):
         subprocess.run(["xdg-open", path], check=False)
 
 
+# -------------------- util UI: misura titolo, ridistribuzione colonne  ----------------
+def _measure_title(widget, text: str) -> int:
+    try:
+        style = ttk.Style()  # più robusto
+        font_name = style.lookup("Treeview.Heading", "font") or "TkDefaultFont"
+    except Exception:
+        font_name = "TkDefaultFont"
+    fnt = tkfont.nametofont(font_name)
+    return fnt.measure(text if text else " ") + 24
+
+def _spread_even_in_tv(tv, cols, minwidths, total_target):
+    """Distribuisce uniformemente lo spazio in più tra le colonne della treeview."""
+    if not cols:
+        mw = max(minwidths[0], total_target)
+        tv.column("—", width=mw, minwidth=minwidths[0], stretch=False, anchor="center")
+        return
+    base_sum = sum(minwidths)
+    extra = max(0, total_target - base_sum)
+    n = len(cols)
+    add_each = extra // n
+    rem = extra % n
+    for i, (c, wmin) in enumerate(zip(cols, minwidths)):
+        w = wmin + add_each + (1 if i < rem else 0)
+        tv.column(c, width=w, minwidth=wmin, stretch=False, anchor="center")
+
+
 # -------------------- Finestra di dettaglio --------------------
 def open_detail_window(root, columns, values, meta):
     win = tk.Toplevel(root)
@@ -458,9 +484,12 @@ def open_detail_window(root, columns, values, meta):
 
     tables_row = tk.Frame(body, bg="#ffffff")
     tables_row.pack(fill="both", expand=True, padx=16, pady=(8,16))
-    for c in range(3):
-        tables_row.columnconfigure(c, weight=0)
-    tables_row.rowconfigure(0, weight=1)
+
+    # 3 colonne di griglia: 0 sinistra (ancorata), 1 centro (elastica), 2 destra (ancorata)
+    tables_row.grid_columnconfigure(0, weight=0)  # sinistra fissa
+    tables_row.grid_columnconfigure(1, weight=1)  # centro prende tutto lo spazio residuo
+    tables_row.grid_columnconfigure(2, weight=0)  # destra fissa
+    tables_row.grid_rowconfigure(0, weight=1)
 
     # --- renderer: Contractual + Loop -------------------------------------------------
     def render_contract_and_loop(tdms_path: str):
@@ -544,19 +573,7 @@ def open_detail_window(root, columns, values, meta):
         ]:
             tk.Label(loop, text=line, bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="w", padx=8, pady=2)
 
-    # ------- util: misura pixel del titolo e calcolo min larghezze colonne --------
-    def _measure_title(widget, text: str) -> int:
-        # usa il font dell'header della Treeview se disponibile, altrimenti default
-        try:
-            style = ttk.Style(widget)
-            font_name = style.lookup("Treeview.Heading", "font") or "TkDefaultFont"
-        except Exception:
-            font_name = "TkDefaultFont"
-        fnt = tkfont.nametofont(font_name)
-        # un po' di padding ai lati per non tagliare le lettere
-        return fnt.measure(text if text else " ") + 24
-
-    # --- renderer: Tre tabelle -------------------------------------------------------
+    # --- renderer: Tre tabelle con ancoraggi sinistra/centro/destra ------------------
     def render_tables(tdms_path: str):
         for w in tables_row.winfo_children():
             w.destroy()
@@ -570,131 +587,101 @@ def open_detail_window(root, columns, values, meta):
         calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
         conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
 
-        def _make_table(parent, title, cols, units):
+        metas = []  # per left, center, right
+
+        def _make_table(parent, title, cols, units, mode):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
             lf.rowconfigure(0, weight=1)
+            lf.columnconfigure(0, weight=(1 if mode == "center" else 0))
 
-            # Treeview senza scrollbar orizzontale: il frame segue la larghezza delle colonne
             tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
 
+            minwidths = []
             if not cols:
                 tv.heading("—", text="—")
-                minw = _measure_title(tv, "—")
-                tv.column("—", minwidth=minw, width=minw, anchor="center", stretch=True)
+                mw = _measure_title(tv, "—")
+                tv.column("—", minwidth=mw, width=mw, anchor="center", stretch=(mode=="center"))
+                minwidths = [mw]
             else:
-                for c_name in cols:
-                    tv.heading(c_name, text=c_name)
-                    # larghezza non inferiore al titolo visualizzato; le colonne possono allungarsi
-                    minw = _measure_title(tv, c_name)
-                    tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=True)
+                for c in cols:
+                    tv.heading(c, text=c)
+                    mw = _measure_title(tv, c)
+                    tv.column(c, minwidth=mw, width=mw, anchor="center", stretch=(mode=="center"))
+                    minwidths.append(mw)
 
-            tv.grid(row=0, column=0, sticky="ns")
+            tv.grid(row=0, column=0, sticky=("nsew" if mode=="center" else "ns"))
             tv.tag_configure("units_row", background="#EFEFEF")
-
-            # riga unità
             if cols:
                 tv.insert("", "end", iid="units", values=tuple(u or "" for u in units), tags=("units_row",))
+            return lf, tv, (cols if cols else ["—"]), minwidths
 
-            return tv, lf
+        # crea le tre tabelle
+        lf_left,  tv_left,  left_cols,  left_mins  = _make_table(tables_row, "Recorded Data",    rec_cols,  rec_units,  "left")
+        lf_mid,   tv_mid,   mid_cols,   mid_mins   = _make_table(tables_row, "Calculated Values", calc_cols, calc_units, "center")
+        lf_right, tv_right, right_cols, right_mins = _make_table(tables_row, "Converted Values",  conv_cols, conv_units, "right")
 
-        # build tabelle
-        tv_rec, lf_rec   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
-        lf_rec.grid(row=0, column=0, sticky="nw", padx=(0,8))
+        # posizionamento: sinistra ancorata a sx, destra a dx, centro riempie
+        lf_left.grid (row=0, column=0, sticky="w",   padx=(0,8))
+        lf_mid.grid  (row=0, column=1, sticky="nsew", padx=8)
+        lf_right.grid(row=0, column=2, sticky="e",   padx=(8,0))
 
-        tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
-        lf_calc.grid(row=0, column=1, sticky="nw", padx=8)
-
-        tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
-        lf_conv.grid(row=0, column=2, sticky="nw", padx=(8,0))
+        # larghezze minime per i frame laterali (servono per definire il “binario” della tabella centrale)
+        left_base  = sum(left_mins)  if left_mins  else 0
+        right_base = sum(right_mins) if right_mins else 0
+        tables_row.grid_columnconfigure(0, minsize=left_base)
+        tables_row.grid_columnconfigure(2, minsize=right_base)
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
-            tv_rec.insert("", "end", iid=f"p{idx:03d}", values=vals)
+            tv_left.insert("", "end", iid=f"p{idx:03d}", values=vals)
         for idx, vals in enumerate(calc_rows, start=1):
-            tv_calc.insert("", "end", iid=f"p{idx:03d}", values=vals)
+            tv_mid.insert("", "end", iid=f"p{idx:03d}", values=vals)
         for idx, vals in enumerate(conv_rows, start=1):
-            tv_conv.insert("", "end", iid=f"p{idx:03d}", values=vals)
+            tv_right.insert("", "end", iid=f"p{idx:03d}", values=vals)
 
-        def _total_pad(value) -> int:
-            if isinstance(value, str):
-                parts = value.split()
-            elif isinstance(value, (tuple, list)):
-                parts = list(value)
-            else:
-                parts = [value]
-            parts = [int(float(p)) for p in parts if str(p).strip()]
-            if not parts:
-                return 0
-            if len(parts) == 1:
-                return parts[0] * 2
-            return parts[0] + parts[1]
-
-        def _enforce_form_width():
+        # ridistribuzione equa SOLO nella tabella centrale in base alla larghezza del suo frame
+        def _resize_center(_e=None):
             try:
-                win.update_idletasks()
+                lf_mid.update_idletasks()
             except Exception:
                 return
-
-            frames = [lf for lf in (lf_rec, lf_calc, lf_conv) if lf.winfo_ismapped()]
-            if not frames:
-                return
-
-            tables_width = sum(f.winfo_reqwidth() for f in frames)
-            grid_padding = sum(_total_pad(f.grid_info().get("padx", 0)) for f in frames)
-            pack_padding = _total_pad(tables_row.pack_info().get("padx", 0)) if tables_row.winfo_manager() == "pack" else 0
-
-            required_width = tables_width + grid_padding + pack_padding
-            min_width = max(1200, required_width)
-
-            win.minsize(min_width, 740)
-
-            current_width = max(win.winfo_width(), win.winfo_reqwidth())
-            if current_width < min_width:
-                current_height = max(win.winfo_height(), win.winfo_reqheight(), 740)
-                win.geometry(f"{min_width}x{current_height}")
-
-        _enforce_form_width()
+            target = max(sum(mid_mins), lf_mid.winfo_width() - 16)  # 16 ~ padding interno
+            _spread_even_in_tv(tv_mid, mid_cols, mid_mins, target)
+        lf_mid.bind("<Configure>", _resize_center)
+        win.after_idle(_resize_center)
 
         # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
-
         def _apply_sync(iid, origin):
-            if not iid or iid == "units":
-                return
-            for tv in (tv_rec, tv_calc, tv_conv):
-                if tv is origin:
-                    continue
+            if not iid or iid == "units": return
+            for tv in (tv_left, tv_mid, tv_right):
+                if tv is origin: continue
                 try:
-                    if not tv.exists(iid):
-                        continue
+                    if not tv.exists(iid): continue
                     cur = tv.selection()
-                    if cur and cur[0] == iid:
-                        continue
+                    if cur and cur[0] == iid: continue
                     tv.selection_set(iid); tv.focus(iid); tv.see(iid)
-                except Exception:
-                    pass
+                except Exception: pass
 
         def _on_select(src_tv, _e=None):
-            if sync_state["syncing"]:
-                return
+            if sync_state["syncing"]: return
             try:
                 sel = src_tv.selection()
                 iid = sel[0] if sel else None
             except Exception:
                 iid = None
-            if not iid or iid == "units" or sync_state["current_iid"] == iid:
-                return
+            if not iid or iid == "units" or sync_state["current_iid"] == iid: return
             sync_state["syncing"] = True
             sync_state["current_iid"] = iid
             win.after_idle(lambda: (_apply_sync(iid, src_tv), sync_state.update(syncing=False)))
 
-        tv_rec.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_rec, e))
-        tv_calc.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_calc, e))
-        tv_conv.bind("<<TreeviewSelect>>", lambda e: _on_select(tv_conv, e))
+        for tv in (tv_left, tv_mid, tv_right):
+            tv.bind("<<TreeviewSelect>>", lambda e, src=tv: _on_select(src, e))
 
+        # selezione iniziale se disponibile
         try:
-            first_iid = next(i for i in tv_rec.get_children() if i != "units")
-            tv_rec.selection_set(first_iid); tv_rec.focus(first_iid); tv_rec.see(first_iid)
+            first_iid = next(i for i in tv_left.get_children() if i != "units")
+            tv_left.selection_set(first_iid); tv_left.focus(first_iid); tv_left.see(first_iid)
         except StopIteration:
             pass
 
@@ -779,5 +766,5 @@ if __name__ == "__main__":
     root.withdraw()
     messagebox.showinfo("Certificate View",
         "Apri la finestra e usa “Carica TDMS…” per scegliere il file.\n"
-        "Ogni tabella adatta le colonne alla larghezza del titolo e puoi scorrere orizzontalmente.")
+        "Sinistra ancorata a sx, destra a dx, centro si adatta tra le due.")
     root.destroy()
