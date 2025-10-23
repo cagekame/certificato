@@ -459,7 +459,7 @@ def open_detail_window(root, columns, values, meta):
     tables_row = tk.Frame(body, bg="#ffffff")
     tables_row.pack(fill="both", expand=True, padx=16, pady=(8,16))
     for c in range(3):
-        tables_row.columnconfigure(c, weight=1, uniform="tbls")
+        tables_row.columnconfigure(c, weight=0)
     tables_row.rowconfigure(0, weight=1)
 
     # --- renderer: Contractual + Loop -------------------------------------------------
@@ -572,12 +572,10 @@ def open_detail_window(root, columns, values, meta):
 
         def _make_table(parent, title, cols, units):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
-            lf.columnconfigure(0, weight=1); lf.rowconfigure(0, weight=1)
+            lf.rowconfigure(0, weight=1)
 
-            # Treeview + scrollbar orizzontale dedicata
+            # Treeview senza scrollbar orizzontale: il frame segue la larghezza delle colonne
             tv = ttk.Treeview(lf, columns=cols or ("—",), show="headings", height=12, selectmode="browse")
-            hsb = ttk.Scrollbar(lf, orient="horizontal", command=tv.xview)
-            tv.configure(xscrollcommand=hsb.set)
 
             if not cols:
                 tv.heading("—", text="—")
@@ -590,36 +588,24 @@ def open_detail_window(root, columns, values, meta):
                     minw = _measure_title(tv, c_name)
                     tv.column(c_name, minwidth=minw, width=minw, anchor="center", stretch=True)
 
-            tv.grid(row=0, column=0, sticky="nsew")
-            hsb.grid(row=1, column=0, sticky="ew")  # barra di scorrimento orizzontale
+            tv.grid(row=0, column=0, sticky="ns")
             tv.tag_configure("units_row", background="#EFEFEF")
 
             # riga unità
             if cols:
                 tv.insert("", "end", iid="units", values=tuple(u or "" for u in units), tags=("units_row",))
 
-            # ritorno anche la funzione che (ri)calcola la larghezza “logica” totale
-            def _total_width():
-                total = 0
-                for c in (cols or ("—",)):
-                    try:
-                        total += int(tv.column(c, option="width"))
-                    except Exception:
-                        pass
-                # padding interno per evitare scroll “a scatti”
-                return total + 8
-
-            return tv, lf, _total_width
+            return tv, lf
 
         # build tabelle
-        tv_rec, lf_rec, rec_total_w   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
-        lf_rec.grid(row=0, column=0, sticky="nsew", padx=(0,8))
+        tv_rec, lf_rec   = _make_table(tables_row, "Recorded Data",   rec_cols,  rec_units)
+        lf_rec.grid(row=0, column=0, sticky="nw", padx=(0,8))
 
-        tv_calc, lf_calc, calc_total_w = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
-        lf_calc.grid(row=0, column=1, sticky="nsew", padx=8)
+        tv_calc, lf_calc = _make_table(tables_row, "Calculated Values", calc_cols, calc_units)
+        lf_calc.grid(row=0, column=1, sticky="nw", padx=8)
 
-        tv_conv, lf_conv, conv_total_w = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
-        lf_conv.grid(row=0, column=2, sticky="nsew", padx=(8,0))
+        tv_conv, lf_conv = _make_table(tables_row, "Converted Values", conv_cols, conv_units)
+        lf_conv.grid(row=0, column=2, sticky="nw", padx=(8,0))
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
@@ -628,23 +614,6 @@ def open_detail_window(root, columns, values, meta):
             tv_calc.insert("", "end", iid=f"p{idx:03d}", values=vals)
         for idx, vals in enumerate(conv_rows, start=1):
             tv_conv.insert("", "end", iid=f"p{idx:03d}", values=vals)
-
-        # quando l'utente allunga una colonna col drag, aggiorniamo la “larghezza logica”
-        def _bind_resize_logic(tv, total_w_fn):
-            def _on_button_release(_e=None):
-                # forza refresh scrollbar/viewport: lo xview tiene conto della somma width colonne
-                tv.update_idletasks()
-                # non serve settare altro: l'hscroll si aggiorna da solo via xscrollcommand
-                # questa funzione esiste solo per essere chiamata dopo i drag
-                return
-            # rilascio mouse dopo drag header/colonna
-            tv.bind("<ButtonRelease-1>", _on_button_release, add="+")
-            # anche dopo eventuali reflow configurazione
-            tv.bind("<Configure>", lambda _e: tv.after_idle(_on_button_release), add="+")
-
-        _bind_resize_logic(tv_rec,  rec_total_w)
-        _bind_resize_logic(tv_calc, calc_total_w)
-        _bind_resize_logic(tv_conv, conv_total_w)
 
         # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
