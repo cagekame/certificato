@@ -410,11 +410,11 @@ def _measure_title(widget, text: str) -> int:
     fnt = tkfont.nametofont(font_name)
     return fnt.measure(text if text else " ") + 24
 
-def _spread_even_in_tv(tv, cols, minwidths, total_target):
+def _spread_even_in_tv(tv, cols, minwidths, total_target, *, stretch=False):
     """Distribuisce uniformemente lo spazio in più tra le colonne della treeview."""
     if not cols:
         mw = max(minwidths[0], total_target)
-        tv.column("—", width=mw, minwidth=minwidths[0], stretch=False, anchor="center")
+        tv.column("—", width=mw, minwidth=minwidths[0], stretch=stretch, anchor="center")
         return
     base_sum = sum(minwidths)
     extra = max(0, total_target - base_sum)
@@ -423,7 +423,7 @@ def _spread_even_in_tv(tv, cols, minwidths, total_target):
     rem = extra % n
     for i, (c, wmin) in enumerate(zip(cols, minwidths)):
         w = wmin + add_each + (1 if i < rem else 0)
-        tv.column(c, width=w, minwidth=wmin, stretch=False, anchor="center")
+        tv.column(c, width=w, minwidth=wmin, stretch=stretch, anchor="center")
 
 
 # -------------------- Finestra di dettaglio --------------------
@@ -431,7 +431,7 @@ def open_detail_window(root, columns, values, meta):
     win = tk.Toplevel(root)
     win.title("Test Certificate")
     win.geometry("1500x900")
-    win.minsize(1200, 740)
+    win.minsize(400, 740)
     win.configure(bg="#f0f0f0")
 
     cert_num   = values[1] if len(values) > 1 else "—"
@@ -587,8 +587,6 @@ def open_detail_window(root, columns, values, meta):
         calc_cols, calc_units, calc_rows = perf["Calc"]["columns"],       perf["Calc"]["units"],       perf["Calc"]["rows"]
         conv_cols, conv_units, conv_rows = perf["Converted"]["columns"],  perf["Converted"]["units"],  perf["Converted"]["rows"]
 
-        metas = []  # per left, center, right
-
         def _make_table(parent, title, cols, units, mode):
             lf = tk.LabelFrame(parent, text=title, bg="#ffffff")
             lf.rowconfigure(0, weight=1)
@@ -625,11 +623,15 @@ def open_detail_window(root, columns, values, meta):
         lf_mid.grid  (row=0, column=1, sticky="nsew", padx=8)
         lf_right.grid(row=0, column=2, sticky="e",   padx=(8,0))
 
-        # larghezze minime per i frame laterali (servono per definire il “binario” della tabella centrale)
+        # min larghezze da titoli (serve per i vincoli di layout)
         left_base  = sum(left_mins)  if left_mins  else 0
+        mid_base   = sum(mid_mins)   if mid_mins   else 0
         right_base = sum(right_mins) if right_mins else 0
-        tables_row.grid_columnconfigure(0, minsize=left_base)
-        tables_row.grid_columnconfigure(2, minsize=right_base)
+
+        # colonna centrale elastica, laterali ancorate
+        tables_row.grid_columnconfigure(0, weight=0, minsize=left_base)
+        tables_row.grid_columnconfigure(1, weight=1, minsize=mid_base)
+        tables_row.grid_columnconfigure(2, weight=0, minsize=right_base)
 
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
@@ -645,10 +647,45 @@ def open_detail_window(root, columns, values, meta):
                 lf_mid.update_idletasks()
             except Exception:
                 return
-            target = max(sum(mid_mins), lf_mid.winfo_width() - 16)  # 16 ~ padding interno
-            _spread_even_in_tv(tv_mid, mid_cols, mid_mins, target)
+            target = max(mid_base, lf_mid.winfo_width() - 16)  # 16 ~ padding interno
+            _spread_even_in_tv(tv_mid, mid_cols, mid_mins, target, stretch=True)
         lf_mid.bind("<Configure>", _resize_center)
         win.after_idle(_resize_center)
+
+        # calcola larghezza minima finestra = somma basi + gap orizzontali reali
+        try:
+            pack_padx = tables_row.pack_info().get("padx", 0)
+        except Exception:
+            pack_padx = 0
+        if isinstance(pack_padx, (tuple, list)):
+            outer_pad = sum(int(p) for p in pack_padx)
+        elif isinstance(pack_padx, str) and pack_padx.strip():
+            parts = pack_padx.strip().split()
+            nums = []
+            for part in parts:
+                try:
+                    nums.append(int(part))
+                except Exception:
+                    continue
+            if len(nums) == 1:
+                outer_pad = nums[0] * 2
+            else:
+                outer_pad = sum(nums[:2])
+        else:
+            try:
+                pad_val = int(pack_padx)
+            except Exception:
+                pad_val = 0
+            outer_pad = pad_val * 2  # pad simmetrico sinistra/destra
+        total_gaps = 16 + outer_pad  # 16 px fra i frame (8+8)
+        min_window_width = left_base + mid_base + right_base + total_gaps
+        win.minsize(min_window_width, 740)
+        win.update_idletasks()
+        current_w = win.winfo_width()
+        current_h = win.winfo_height()
+        target_h = current_h if current_h and current_h > 1 else 740
+        if current_w < min_window_width:
+            win.geometry(f"{min_window_width}x{max(740, target_h)}")
 
         # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
@@ -763,8 +800,11 @@ def open_detail_window(root, columns, values, meta):
 # (opzionale) piccolo demo standalone:
 if __name__ == "__main__":
     root = tk.Tk()
-    root.withdraw()
-    messagebox.showinfo("Certificate View",
-        "Apri la finestra e usa “Carica TDMS…” per scegliere il file.\n"
-        "Sinistra ancorata a sx, destra a dx, centro si adatta tra le due.")
-    root.destroy()
+    root.title("Certificate Demo")
+    open_detail_window(
+        root,
+        columns=[],
+        values=["JOB-12345", "CERT-001", "—", "PUMP-ABC", "2025-03-01"],
+        meta={},
+    )
+    root.mainloop()
