@@ -408,7 +408,7 @@ def _measure_title(widget, text: str) -> int:
     except Exception:
         font_name = "TkDefaultFont"
     fnt = tkfont.nametofont(font_name)
-    return fnt.measure(text if text else " ") + 24
+    return fnt.measure(text if text else " ") + 40
 
 def _spread_even_in_tv(tv, cols, minwidths, total_target, *, stretch=False):
     """Distribuisce uniformemente lo spazio in più tra le colonne della treeview."""
@@ -430,8 +430,7 @@ def _spread_even_in_tv(tv, cols, minwidths, total_target, *, stretch=False):
 def open_detail_window(root, columns, values, meta):
     win = tk.Toplevel(root)
     win.title("Test Certificate")
-    win.geometry("1500x900")
-    win.minsize(400, 740)
+    win.minsize(400, 800)
     win.configure(bg="#f0f0f0")
 
     cert_num   = values[1] if len(values) > 1 else "—"
@@ -623,8 +622,61 @@ def open_detail_window(root, columns, values, meta):
         lf_mid.grid  (row=0, column=1, sticky="nsew", padx=8)
         lf_right.grid(row=0, column=2, sticky="e",   padx=(8,0))
 
+        # --- clamp: impedisce a left/right di uscire dal proprio frame ---
+        def _clamp_tv_to_frame(tv, cols, mins, frame, pad=16):
+            """Riduce le colonne (senza scendere sotto i min) per stare dentro il frame."""
+            try:
+                frame.update_idletasks()
+            except Exception:
+                pass
+
+            if not cols:
+                # colonna placeholder "—": limita al frame
+                avail = max(mins[0], frame.winfo_width() - pad)
+                cur   = tv.column("—", option="width")
+                tv.column("—", width=min(cur, avail))
+                return
+
+            avail = max(sum(mins), frame.winfo_width() - pad)
+            widths = [tv.column(c, "width") for c in cols]
+            total  = sum(widths)
+            if total <= avail:
+                return  # già dentro
+
+            extra = total - avail  # quanto dobbiamo togliere
+            while extra > 0 and any(w > m for w, m in zip(widths, mins)):
+                idxs = [i for i, (w, m) in enumerate(zip(widths, mins)) if w > m]
+                if not idxs:
+                    break
+                dec = max(1, extra // len(idxs))
+                for i in idxs:
+                    if extra <= 0:
+                        break
+                    room = widths[i] - mins[i]
+                    d = min(dec, room)
+                    widths[i] -= d
+                    extra -= d
+
+            for c, w in zip(cols, widths):
+                tv.column(c, width=w)
+
+        # clamp su resize del frame sinistro/destro
+        lf_left.bind("<Configure>",  lambda e: _clamp_tv_to_frame(tv_left,  left_cols,  left_mins,  lf_left))
+        lf_right.bind("<Configure>", lambda e: _clamp_tv_to_frame(tv_right, right_cols, right_mins, lf_right))
+
+        # clamp dopo drag dei separatori di colonna (rilascio)
+        def _maybe_clamp_after_drag(tv, cols, mins, frame):
+            tv.update_idletasks()
+            _clamp_tv_to_frame(tv, cols, mins, frame)
+
+        tv_left.bind("<ButtonRelease-1>",  lambda e: _maybe_clamp_after_drag(tv_left,  left_cols,  left_mins,  lf_left))
+        tv_right.bind("<ButtonRelease-1>", lambda e: _maybe_clamp_after_drag(tv_right, right_cols, right_mins, lf_right))
+        # opzionale: anche durante il trascinamento
+        # tv_left.bind("<B1-Motion>",  lambda e: _maybe_clamp_after_drag(tv_left,  left_cols,  left_mins,  lf_left))
+        # tv_right.bind("<B1-Motion>", lambda e: _maybe_clamp_after_drag(tv_right, right_cols, right_mins, lf_right))
+
         # min larghezze da titoli (serve per i vincoli di layout)
-        left_base  = sum(left_mins)  if left_mins  else 0
+        left_base  = sum(left_mins) if left_mins  else 0
         mid_base   = sum(mid_mins)   if mid_mins   else 0
         right_base = sum(right_mins) if right_mins else 0
 
@@ -632,7 +684,7 @@ def open_detail_window(root, columns, values, meta):
         tables_row.grid_columnconfigure(0, weight=0, minsize=left_base)
         tables_row.grid_columnconfigure(1, weight=1, minsize=mid_base)
         tables_row.grid_columnconfigure(2, weight=0, minsize=right_base)
-
+        
         # inserisci righe dati (p001, p002, ...)
         for idx, vals in enumerate(rec_rows, start=1):
             tv_left.insert("", "end", iid=f"p{idx:03d}", values=vals)
@@ -652,40 +704,57 @@ def open_detail_window(root, columns, values, meta):
         lf_mid.bind("<Configure>", _resize_center)
         win.after_idle(_resize_center)
 
-        # calcola larghezza minima finestra = somma basi + gap orizzontali reali
-        try:
-            pack_padx = tables_row.pack_info().get("padx", 0)
-        except Exception:
-            pack_padx = 0
-        if isinstance(pack_padx, (tuple, list)):
-            outer_pad = sum(int(p) for p in pack_padx)
-        elif isinstance(pack_padx, str) and pack_padx.strip():
-            parts = pack_padx.strip().split()
-            nums = []
-            for part in parts:
+        # --- minsize robusta: usa la larghezza richiesta del blocco tabelle ---
+        def _apply_minsize_once():
+            # 1) Assicura che _resize_center abbia finito
+            win.update_idletasks()
+
+            # 2) Larghezza richiesta del solo "riga tabelle" (tre LabelFrame + grid padx)
+            tables_req = tables_row.winfo_reqwidth()
+
+            # 3) Considera anche gli altri blocchi orizzontali sopra (header/contract/loop)
+            header_req  = header.winfo_reqwidth()
+            blocks_req  = blocks.winfo_reqwidth()
+            content_req = max(tables_req, blocks_req, header_req)
+
+            # 4) Padding esterni (pack) che NON sono inclusi in reqwidth
+            def _pack_padx_total(widget):
                 try:
-                    nums.append(int(part))
+                    px = widget.pack_info().get("padx", 0)
                 except Exception:
-                    continue
-            if len(nums) == 1:
-                outer_pad = nums[0] * 2
-            else:
-                outer_pad = sum(nums[:2])
-        else:
+                    return 0
+                if isinstance(px, (tuple, list)):
+                    return sum(int(p) for p in px)
+                try:
+                    return int(px) * 2  # singolo => sx+dx
+                except Exception:
+                    return 0
+
+            outer_tables = _pack_padx_total(tables_row)  # nel tuo codice è 16 per lato => 32
+            outer_nb     = _pack_padx_total(nb)          # Notebook: nel tuo codice è 10 per lato => 20
+
+            # 5) Scrollbar verticale del canvas “ruba” spazio orizzontale
             try:
-                pad_val = int(pack_padx)
+                vscroll_w = max(vscroll.winfo_reqwidth(), 15)
             except Exception:
-                pad_val = 0
-            outer_pad = pad_val * 2  # pad simmetrico sinistra/destra
-        total_gaps = 16 + outer_pad  # 16 px fra i frame (8+8)
-        min_window_width = left_base + mid_base + right_base + total_gaps
-        win.minsize(min_window_width, 740)
-        win.update_idletasks()
-        current_w = win.winfo_width()
-        current_h = win.winfo_height()
-        target_h = current_h if current_h and current_h > 1 else 740
-        if current_w < min_window_width:
-            win.geometry(f"{min_window_width}x{max(740, target_h)}")
+                vscroll_w = 15
+
+            safety = 12  # margine anti-sottostima (bordi tema ttk, arrotondamenti)
+            min_window_width = content_req + outer_tables + outer_nb + vscroll_w + safety
+
+            EXTRA_HEIGHT = 100   # 👈 decidi tu di quanto vuoi aumentare l’altezza
+            BASE_HEIGHT  = 740   # valore di partenza usato nel codice originale
+
+            min_window_height = BASE_HEIGHT + EXTRA_HEIGHT
+
+            win.minsize(min_window_width, min_window_height)
+            if win.winfo_width() < min_window_width or win.winfo_height() < min_window_height:
+                win.geometry(f"{min_window_width}x{min_window_height}")
+
+
+        # Esegui due volte a idle per essere sicuri che tutti i layout siano stabili
+        win.after_idle(_apply_minsize_once)
+        win.after_idle(lambda: win.after_idle(_apply_minsize_once))
 
         # sync selezione (ignora 'units')
         sync_state = {"syncing": False, "current_iid": None}
@@ -737,7 +806,7 @@ def open_detail_window(root, columns, values, meta):
     # Render iniziale: NESSUN caricamento automatico
     render_contract_and_loop(state["tdms_path"])
     render_tables(state["tdms_path"])
-
+    
     # Footer
     footer = tk.Frame(tab, bg="#ffffff")
     footer.grid(row=2, column=0, sticky="ew", padx=16, pady=(8,16))
