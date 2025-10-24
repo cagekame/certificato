@@ -3,7 +3,7 @@ import os
 import sys
 import re
 import math
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont  # <— per misurare i titoli
@@ -341,29 +341,25 @@ def read_performance_tables_dynamic(tdms_path: str, test_index: int = 0):
     if not (tdms_path and os.path.exists(tdms_path) and NPTDMS_OK):
         return out
     try:
-        tdms = TdmsFile.open(tdms_path)
+        with TdmsFile.open(tdms_path) as tdms:
+            points = _collect_perf_points(tdms, test_index=test_index)
+            if not points:
+                return out
+            by_kind = {k: defaultdict(list) for k in KIND_ORDER}
+            for p, kinds in points.items():
+                for k in KIND_ORDER:
+                    if kinds[k]:
+                        by_kind[k][p].extend(kinds[k])
+
+            for k in KIND_ORDER:
+                if by_kind[k]:
+                    cols, units, rows = _build_kind_model_no_unit(by_kind[k])
+                    out[k]["columns"] = cols
+                    out[k]["units"]   = units
+                    out[k]["rows"]    = rows
+            return out
     except Exception:
         return out
-    try:
-        points = _collect_perf_points(tdms, test_index=test_index)
-        if not points:
-            return out
-        by_kind = {k: defaultdict(list) for k in KIND_ORDER}
-        for p, kinds in points.items():
-            for k in KIND_ORDER:
-                if kinds[k]:
-                    by_kind[k][p].extend(kinds[k])
-
-        for k in KIND_ORDER:
-            if by_kind[k]:
-                cols, units, rows = _build_kind_model_no_unit(by_kind[k])
-                out[k]["columns"] = cols
-                out[k]["units"]   = units
-                out[k]["rows"]    = rows
-        return out
-    finally:
-        try: tdms.close()
-        except Exception: pass
 
 
 # -------------------- Export PDF placeholder --------------------
@@ -401,7 +397,7 @@ def _open_file_with_os(path: str):
 
 
 # -------------------- util UI: misura titolo, ridistribuzione colonne  ----------------
-def _measure_title(widget, text: str) -> int:
+def _measure_title(text: str) -> int:
     try:
         style = ttk.Style()  # più robusto
         font_name = style.lookup("Treeview.Heading", "font") or "TkDefaultFont"
@@ -454,7 +450,7 @@ def open_detail_window(root, columns, values, meta):
     header.columnconfigure(1, weight=1)
     tk.Label(header, text="TEST CERTIFICATE", bg="#ffffff", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
     right = tk.Frame(header, bg="#ffffff"); right.grid(row=0, column=1, sticky="e")
-    tk.Button(right, text="Carica TDMS…", command=lambda: do_load_tdms(), width=14).pack(side="right", padx=(8,0))
+    tk.Button(right, text="Carica TDMS…", command=do_load_tdms, width=14).pack(side="right", padx=(8,0))
     lbl_cert = tk.Label(right, text=f"N° Cert.: {cert_num}", bg="#ffffff", font=("Segoe UI", 10)); lbl_cert.pack(anchor="e")
     tk.Label(right, text="U.M. System: SI (Metric)", bg="#ffffff", font=("Segoe UI", 10)).pack(anchor="e")
     lbl_date = tk.Label(right, text=f"Test Date: {test_date}", bg="#ffffff", font=("Segoe UI", 10)); lbl_date.pack(anchor="e")
@@ -502,40 +498,38 @@ def open_detail_window(root, columns, values, meta):
 
         if NPTDMS_OK and tdms_path and os.path.exists(tdms_path):
             try:
-                tdms = TdmsFile.open(tdms_path)
-                cap     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Capacity [m3/h]")
-                tdh     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "TDH [m]")
-                eff     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Efficiency [%]")
-                abs_pow = tdms_read_scalar_string(tdms, "Ref. Contract Data", "ABS_Power [kW]")
-                speed   = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Speed [rpm]")
-                sg      = tdms_read_scalar_string(tdms, "Ref. Contract Data", "SG Contract")
-                temp    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Temperature [C]")
-                visc    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Viscosity [cP]")
-                npsh    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "NPSH [m]")
-                liquid  = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Liquid")
+                with TdmsFile.open(tdms_path) as tdms:
+                    cap     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Capacity [m3/h]")
+                    tdh     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "TDH [m]")
+                    eff     = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Efficiency [%]")
+                    abs_pow = tdms_read_scalar_string(tdms, "Ref. Contract Data", "ABS_Power [kW]")
+                    speed   = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Speed [rpm]")
+                    sg      = tdms_read_scalar_string(tdms, "Ref. Contract Data", "SG Contract")
+                    temp    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Temperature [C]")
+                    visc    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Viscosity [cP]")
+                    npsh    = tdms_read_scalar_string(tdms, "Ref. Contract Data", "NPSH [m]")
+                    liquid  = tdms_read_scalar_string(tdms, "Ref. Contract Data", "Liquid")
 
-                cust    = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Customer")
-                po      = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Purchaser Order")
-                end_user= tdms_read_scalar_string(tdms, "Ref. Test Param.", "End User")
-                specs   = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Applic. Specs.")
+                    cust    = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Customer")
+                    po      = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Purchaser Order")
+                    end_user= tdms_read_scalar_string(tdms, "Ref. Test Param.", "End User")
+                    specs   = tdms_read_scalar_string(tdms, "Ref. Test Param.", "Applic. Specs.")
 
-                item    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Item")
-                pump    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Pump")
-                sn      = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Serial Number_Elenco")
-                imp_draw= tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Drawing")
-                imp_mat = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Material")
-                imp_dia = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Diam Nominal")
+                    item    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Item")
+                    pump    = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Pump")
+                    sn      = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Serial Number_Elenco")
+                    imp_draw= tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Drawing")
+                    imp_mat = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Impeller Material")
+                    imp_dia = tdms_read_scalar_string(tdms, "Ref. Pump Type", "Diam Nominal")
 
-                suction     = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Suction [Inch]")
-                discharge   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Discharge [Inch]")
-                watt_const  = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Wattmeter Const.")
-                atmpress    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "AtmPress [m]")
-                knpsh       = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KNPSH [m]")
-                watertemp   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "WaterTemp [C]")
-                kventuri    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KVenturi")
+                    suction     = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Suction [Inch]")
+                    discharge   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Discharge [Inch]")
+                    watt_const  = tdms_read_scalar_string(tdms, "Ref. Test Detail", "Wattmeter Const.")
+                    atmpress    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "AtmPress [m]")
+                    knpsh       = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KNPSH [m]")
+                    watertemp   = tdms_read_scalar_string(tdms, "Ref. Test Detail", "WaterTemp [C]")
+                    kventuri    = tdms_read_scalar_string(tdms, "Ref. Test Detail", "KVenturi")
 
-                try: tdms.close()
-                except Exception: pass
             except Exception:
                 pass
 
@@ -596,13 +590,13 @@ def open_detail_window(root, columns, values, meta):
             minwidths = []
             if not cols:
                 tv.heading("—", text="—")
-                mw = _measure_title(tv, "—")
+                mw = _measure_title("—")
                 tv.column("—", minwidth=mw, width=mw, anchor="center", stretch=(mode=="center"))
                 minwidths = [mw]
             else:
                 for c in cols:
                     tv.heading(c, text=c)
-                    mw = _measure_title(tv, c)
+                    mw = _measure_title(c)
                     tv.column(c, minwidth=mw, width=mw, anchor="center", stretch=(mode=="center"))
                     minwidths.append(mw)
 
