@@ -866,14 +866,3 @@ def open_detail_window(root, columns, values, meta):
         .grid(row=0, column=3, sticky="ew", padx=(6,0))
 
 
-# (opzionale) piccolo demo standalone:
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.title("Certificate Demo")
-    open_detail_window(
-        root,
-        columns=[],
-        values=["JOB-12345", "CERT-001", "—", "PUMP-ABC", "2025-03-01"],
-        meta={},
-    )
-    root.mainloop()
